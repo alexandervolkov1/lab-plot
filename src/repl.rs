@@ -6,6 +6,9 @@ use eframe::egui;
 use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 
+mod highlight;
+mod indent;
+
 const MAX_COMMAND_HISTORY: usize = 200;
 
 #[derive(Default)]
@@ -172,12 +175,45 @@ impl Repl {
             }
         }
 
+        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut job = highlight::highlight(text.as_str());
+            job.wrap.max_width = wrap_width;
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+
+        if focused {
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+                if let Some(cursor_range) = state.cursor.char_range() {
+                    let enter = ui.input_mut(|input| {
+                        input.modifiers.matches_exact(egui::Modifiers::NONE)
+                            && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    });
+
+                    if enter {
+                        let range = cursor_range.as_sorted_char_range();
+
+                        let new_cursor =
+                            indent::insert_newline(&mut self.input, range.start.0, range.end.0);
+
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(new_cursor),
+                            )));
+
+                        state.store(ui.ctx(), editor_id);
+                    }
+                }
+            }
+        }
+
         let editor = ui.add(
             egui::TextEdit::multiline(&mut self.input)
                 .id(editor_id)
                 .font(egui::TextStyle::Monospace)
                 .desired_rows(4)
-                .desired_width(f32::INFINITY),
+                .desired_width(f32::INFINITY)
+                .layouter(&mut layouter),
         );
 
         if history_moved {
@@ -240,7 +276,6 @@ mod tests {
         assert!(history.previous(&mut input));
         assert_eq!(input, "(+ 1 2)");
 
-        // Дальше самой старой команды не уходим.
         assert!(history.previous(&mut input));
         assert_eq!(input, "(+ 1 2)");
 
