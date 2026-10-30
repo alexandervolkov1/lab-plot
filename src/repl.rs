@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -5,12 +6,73 @@ use eframe::egui;
 use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
 
+const MAX_COMMAND_HISTORY: usize = 200;
+
+#[derive(Default)]
+struct CommandHistory {
+    commands: VecDeque<String>,
+    position: Option<usize>,
+    draft: String,
+}
+
+impl CommandHistory {
+    fn record(&mut self, source: &str) {
+        if self.commands.back().map(String::as_str) != Some(source) {
+            if self.commands.len() == MAX_COMMAND_HISTORY {
+                self.commands.pop_front();
+            }
+
+            self.commands.push_back(source.to_owned());
+        }
+
+        self.position = None;
+        self.draft.clear();
+    }
+
+    fn previous(&mut self, input: &mut String) -> bool {
+        if self.commands.is_empty() {
+            return false;
+        }
+
+        let index = match self.position {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.draft.clone_from(input);
+                self.commands.len() - 1
+            }
+        };
+
+        self.position = Some(index);
+        input.clone_from(&self.commands[index]);
+
+        true
+    }
+
+    fn next(&mut self, input: &mut String) -> bool {
+        let Some(index) = self.position else {
+            return false;
+        };
+
+        if index + 1 < self.commands.len() {
+            let next = index + 1;
+            self.position = Some(next);
+            input.clone_from(&self.commands[next]);
+        } else {
+            self.position = None;
+            *input = std::mem::take(&mut self.draft);
+        }
+
+        true
+    }
+}
+
 pub struct Repl {
     input: String,
     history: Vec<String>,
     busy: bool,
     request_tx: Sender<String>,
     response_rx: Receiver<String>,
+    command_history: CommandHistory,
 }
 
 impl Repl {
@@ -57,6 +119,7 @@ impl Repl {
             busy: false,
             request_tx,
             response_rx,
+            command_history: CommandHistory::default(),
         }
     }
 
@@ -75,24 +138,66 @@ impl Repl {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for entry in &self.history {
-                    ui.monospace(entry);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(entry).monospace()).selectable(true),
+                    );
                 }
             });
 
         ui.separator();
 
+        let editor_id = ui.make_persistent_id("steel_repl_input");
+
+        let focused =
+            ui.memory(|memory| memory.has_focus(editor_id)) && ui.input(|input| input.focused);
+
+        let mut history_moved = false;
+
+        if focused {
+            let (previous, next) = ui.input_mut(|input| {
+                if input.modifiers.matches_exact(egui::Modifiers::CTRL) {
+                    (
+                        input.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp),
+                        input.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown),
+                    )
+                } else {
+                    (false, false)
+                }
+            });
+
+            if previous {
+                history_moved = self.command_history.previous(&mut self.input);
+            } else if next {
+                history_moved = self.command_history.next(&mut self.input);
+            }
+        }
+
         let editor = ui.add(
             egui::TextEdit::multiline(&mut self.input)
+                .id(editor_id)
+                .font(egui::TextStyle::Monospace)
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
         );
+
+        if history_moved {
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+                let cursor = egui::text::CCursor::new(self.input.chars().count());
+
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+
+                state.store(ui.ctx(), editor_id);
+            }
+        }
 
         let keyboard_submit =
             editor.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
 
         ui.horizontal(|ui| {
             let clicked = ui
-                .add_enabled(!self.busy, egui::Button::new("Выполнить"))
+                .add_enabled(!self.busy, egui::Button::new("Execute"))
                 .clicked();
 
             if (clicked || keyboard_submit) && !self.busy && !self.input.trim().is_empty() {
@@ -100,10 +205,12 @@ impl Repl {
 
                 self.history.push(format!("> {source}"));
 
-                if self.request_tx.send(source).is_ok() {
+                if self.request_tx.send(source.clone()).is_ok() {
+                    self.command_history.record(&source);
                     self.busy = true;
                 } else {
                     self.history.push("Steel Engine unavailable".into());
+                    self.input = source;
                 }
             }
 
@@ -111,5 +218,70 @@ impl Repl {
                 ui.spinner();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_navigation_restores_draft() {
+        let mut history = CommandHistory::default();
+
+        history.record("(+ 1 2)");
+        history.record("(+ 3 4)");
+
+        let mut input = "(define x 10)".to_owned();
+
+        assert!(history.previous(&mut input));
+        assert_eq!(input, "(+ 3 4)");
+
+        assert!(history.previous(&mut input));
+        assert_eq!(input, "(+ 1 2)");
+
+        // Дальше самой старой команды не уходим.
+        assert!(history.previous(&mut input));
+        assert_eq!(input, "(+ 1 2)");
+
+        assert!(history.next(&mut input));
+        assert_eq!(input, "(+ 3 4)");
+
+        assert!(history.next(&mut input));
+        assert_eq!(input, "(define x 10)");
+
+        assert!(!history.next(&mut input));
+    }
+
+    #[test]
+    fn history_skips_consecutive_duplicates() {
+        let mut history = CommandHistory::default();
+
+        history.record("(+ 1 2)");
+        history.record("(+ 1 2)");
+
+        assert_eq!(history.commands.len(), 1);
+    }
+
+    #[test]
+    fn history_has_bounded_size() {
+        let mut history = CommandHistory::default();
+
+        for i in 0..205 {
+            history.record(&format!("(+ {i} 1)"));
+        }
+
+        assert_eq!(history.commands.len(), 200);
+        assert_eq!(history.commands.front().unwrap(), "(+ 5 1)");
+        assert_eq!(history.commands.back().unwrap(), "(+ 204 1)");
+    }
+
+    #[test]
+    fn empty_history_preserves_input() {
+        let mut history = CommandHistory::default();
+        let mut input = "(define x 42)".to_owned();
+
+        assert!(!history.previous(&mut input));
+        assert_eq!(input, "(define x 42)");
     }
 }

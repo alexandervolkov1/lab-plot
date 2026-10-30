@@ -152,7 +152,7 @@ impl LabPlot {
 
         Self {
             repl,
-            repl_visible: true,
+            repl_visible: false,
             plot_rx,
             plots: PlotState::default(),
         }
@@ -168,13 +168,9 @@ impl eframe::App for LabPlot {
         self.repl.poll();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("lab-plot");
-
-            if ui.button("Открыть Steel REPL").clicked() {
+            if ui.button("REPL").clicked() {
                 self.repl_visible = true;
             }
-
-            ui.label(format!("Кривых: {}", self.plots.series.len()));
 
             Plot::new("main_plot")
                 .legend(Legend::default())
@@ -278,6 +274,24 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(visuals);
+
+    ctx.all_styles_mut(|style| {
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(21.0));
+    });
 }
 
 #[cfg(test)]
