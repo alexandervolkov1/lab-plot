@@ -92,6 +92,7 @@ pub struct Repl {
     input: String,
     history: VecDeque<String>,
     last_output: String,
+    scroll_history_to_end: bool,
     file_error: Option<String>,
     pending_action: Option<FileAction>,
     pending_save: Option<PathBuf>,
@@ -126,11 +127,7 @@ impl Repl {
                             .map(|value| value.to_string())
                             .collect::<Vec<_>>()
                             .join("\n");
-                        if text.is_empty() {
-                            "(нет результата)".into()
-                        } else {
-                            text
-                        }
+                        if text.is_empty() { "ok".into() } else { text }
                     }
                     Err(error) => format!("Error: {error}"),
                 };
@@ -145,6 +142,7 @@ impl Repl {
             input: String::new(),
             history: VecDeque::new(),
             last_output: String::new(),
+            scroll_history_to_end: false,
             file_error: None,
             pending_action: None,
             pending_save: None,
@@ -163,6 +161,7 @@ impl Repl {
                 Ok(result) => {
                     self.record_history(&result);
                     self.last_output = result;
+                    self.scroll_history_to_end = true;
                     self.busy = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -170,6 +169,7 @@ impl Repl {
                     if self.busy {
                         self.last_output = "Steel Engine unavailable".into();
                         self.record_history("Steel Engine unavailable");
+                        self.scroll_history_to_end = true;
                         self.busy = false;
                     }
                     break;
@@ -200,6 +200,8 @@ impl Repl {
         }
         if self.request_tx.send(EvalRequest { source, path }).is_err() {
             self.last_output = "Steel Engine unavailable".into();
+            self.record_history("Steel Engine unavailable");
+            self.scroll_history_to_end = true;
             return false;
         }
         self.record_history(entry);
@@ -456,9 +458,9 @@ impl Repl {
                 let height = ui.available_height();
                 egui::Panel::bottom("steel_repl_panel")
                     .resizable(true)
-                    .default_size(height * 0.3)
+                    .default_size(height * 0.4)
                     .min_size(140.0)
-                    .max_size((height - 100.0).max(140.0))
+                    .max_size((height - 140.0).max(140.0))
                     .show(ui, |ui| self.repl_ui(ui));
                 egui::CentralPanel::default().show(ui, |ui| {
                     let id = ui.make_persistent_id("steel_script_editor");
@@ -482,6 +484,38 @@ impl Repl {
 
     fn repl_ui(&mut self, ui: &mut egui::Ui) {
         ui.set_min_height(ui.available_height());
+        let width = ui.available_width();
+        egui::Panel::right("steel_repl_history")
+            .resizable(true)
+            .default_size(width * 0.4)
+            .min_size(160.0)
+            .max_size((width - 220.0).max(160.0))
+            .show(ui, |ui| {
+                ui.take_available_space();
+                ui.strong("History");
+                egui::ScrollArea::vertical()
+                    .id_salt("execution_history_scroll")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (index, entry) in self.history.iter().enumerate() {
+                            let response = ui.add(
+                                egui::Label::new(egui::RichText::new(entry).monospace())
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                            if self.scroll_history_to_end && index + 1 == self.history.len() {
+                                response.scroll_to_me(Some(egui::Align::BOTTOM));
+                            }
+                        }
+                    });
+                self.scroll_history_to_end = false;
+            });
+        egui::CentralPanel::default().show(ui, |ui| self.repl_input_ui(ui));
+    }
+
+    fn repl_input_ui(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_height(ui.available_height());
         ui.strong("REPL");
         let id = ui.make_persistent_id("steel_repl_input");
         let focused = ui.is_enabled() && ui.memory(|m| m.has_focus(id)) && ui.input(|i| i.focused);
@@ -494,7 +528,7 @@ impl Repl {
             }
         }
         let cursor = moved.then(|| self.input.chars().count());
-        let input_height = (ui.available_height() * 0.45).max(40.0);
+        let input_height = (ui.available_height() - 60.0).max(40.0);
         let submit = egui::ScrollArea::vertical()
             .id_salt("repl_input_scroll")
             .max_height(input_height)
@@ -512,17 +546,8 @@ impl Repl {
             if self.busy {
                 ui.spinner();
             }
-            ui.weak("Ctrl+Enter · Ctrl+PageUp/PageDown");
         });
-        // Only the latest result is visible; earlier commands/results remain in RAM.
-        egui::ScrollArea::vertical()
-            .id_salt("latest_result_scroll")
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&self.last_output).monospace())
-                        .selectable(true),
-                );
-            });
+        ui.weak("Ctrl+Enter · Ctrl+PageUp/PageDown");
     }
 }
 
@@ -581,6 +606,42 @@ fn code_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn void_success_values_and_errors_are_recorded_in_existing_history() {
+        let mut repl = Repl::new(|_| {});
+        repl.input = "(define x 10)".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert_eq!(repl.last_output, "ok");
+        assert_eq!(repl.history.back().unwrap(), "ok");
+        assert!(repl.scroll_history_to_end);
+        repl.input = "(+ x 5)".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert_eq!(repl.last_output, "15");
+        repl.input = "(unknown-function)".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert!(repl.last_output.starts_with("Error:"));
+        assert_eq!(repl.history.len(), 6);
+        assert_eq!(repl.history[0], "> (define x 10)");
+        assert_eq!(repl.history[2], "> (+ x 5)");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("definitions.scm");
+        std::fs::write(&path, "(define y 20)").unwrap();
+        repl.script.open(&path).unwrap();
+        repl.run_script();
+        finish(&mut repl);
+        assert_eq!(repl.last_output, "ok");
+        assert_eq!(repl.history[6], "Run script: definitions.scm");
+        assert_eq!(repl.history[7], "ok");
+        assert_eq!(repl.script.text, "(define y 20)");
+        repl.input = "(+ x y)".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert_eq!(repl.last_output, "30");
+    }
 
     #[test]
     fn dirty_close_is_cancelled_at_viewport_level_and_cancel_keeps_buffer() {
@@ -753,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_renders_only_latest_result_and_preserves_state_when_reopened() {
+    fn ui_renders_execution_history_and_preserves_state_when_reopened() {
         fn visible_text(shape: &egui::epaint::Shape, text: &mut String) {
             match shape {
                 egui::epaint::Shape::Text(t) => text.push_str(&t.galley.job.text),
@@ -768,9 +829,9 @@ mod tests {
         let mut repl = Repl::new(|_| {});
         repl.script.text = "(define retained 42)".into();
         repl.input = "unfinished input".into();
-        repl.history
-            .push_back("PREVIOUS_RESULT_MUST_BE_HIDDEN".into());
+        repl.history.push_back("PREVIOUS_RESULT_VISIBLE".into());
         repl.last_output = "LATEST_RESULT_VISIBLE".into();
+        repl.history.push_back(repl.last_output.clone());
         let ctx = egui::Context::default();
         for _ in 0..2 {
             // Hide/reopen keeps this same Repl, exactly as LabPlot does.
@@ -780,7 +841,7 @@ mod tests {
                 visible_text(&shape.shape, &mut text);
             }
             assert!(text.contains("LATEST_RESULT_VISIBLE"));
-            assert!(!text.contains("PREVIOUS_RESULT_MUST_BE_HIDDEN"));
+            assert!(text.contains("PREVIOUS_RESULT_VISIBLE"));
             assert_eq!(repl.script.text, "(define retained 42)");
             assert_eq!(repl.input, "unfinished input");
             output.drop_without_applying_deltas();
@@ -788,57 +849,94 @@ mod tests {
     }
 
     #[test]
-    fn repl_panel_can_be_resized_by_dragging_the_separator() {
-        fn separator(output: &egui::FullOutput) -> f32 {
+    fn repl_panels_keep_proportions_and_both_separators_can_be_dragged() {
+        fn separator(output: &egui::FullOutput, vertical: bool) -> egui::Pos2 {
             output
                 .shapes
                 .iter()
                 .find_map(|shape| {
-                    if let egui::epaint::Shape::LineSegment { points, .. } = &shape.shape
-                        && points[0].y == points[1].y
-                        && (points[0].x - points[1].x).abs() > 600.0
-                    {
-                        Some(points[0].y)
-                    } else {
-                        None
+                    if let egui::epaint::Shape::LineSegment { points, .. } = &shape.shape {
+                        let delta = points[1] - points[0];
+                        if (vertical && delta.x == 0.0 && delta.y.abs() > 100.0)
+                            || (!vertical && delta.y == 0.0 && delta.x.abs() > 600.0)
+                        {
+                            return Some(points[0]);
+                        }
                     }
+                    None
                 })
                 .expect("panel separator")
+        }
+        fn drag(ctx: &egui::Context, repl: &mut Repl, start: egui::Pos2, end: egui::Pos2) {
+            for events in [
+                vec![egui::Event::PointerMoved(start)],
+                vec![egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerMoved(end)],
+                vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ] {
+                frame(ctx, repl, events).drop_without_applying_deltas();
+            }
         }
         let ctx = egui::Context::default();
         let mut repl = Repl::new(|_| {});
         let output = frame(&ctx, &mut repl, vec![]);
-        let initial_y = separator(&output);
+        let horizontal_y = separator(&output, false).y;
+        let vertical_x = separator(&output, true).x;
+        assert!((400.0..490.0).contains(&horizontal_y), "40% REPL height");
+        assert!(
+            (460.0..510.0).contains(&vertical_x),
+            "60/40 input/history width"
+        );
         output.drop_without_applying_deltas();
-        let start = egui::pos2(400.0, initial_y);
-        let end = start - egui::vec2(0.0, 80.0);
-        frame(&ctx, &mut repl, vec![egui::Event::PointerMoved(start)])
-            .drop_without_applying_deltas();
-        frame(
+
+        drag(
             &ctx,
             &mut repl,
-            vec![egui::Event::PointerButton {
-                pos: start,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        )
-        .drop_without_applying_deltas();
-        frame(&ctx, &mut repl, vec![egui::Event::PointerMoved(end)]).drop_without_applying_deltas();
-        frame(
-            &ctx,
-            &mut repl,
-            vec![egui::Event::PointerButton {
-                pos: end,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        )
-        .drop_without_applying_deltas();
+            egui::pos2(400.0, horizontal_y),
+            egui::pos2(400.0, horizontal_y - 80.0),
+        );
         let output = frame(&ctx, &mut repl, vec![]);
-        assert!(separator(&output) < initial_y - 50.0);
+        assert!(separator(&output, false).y < horizontal_y - 50.0);
+        output.drop_without_applying_deltas();
+
+        drag(
+            &ctx,
+            &mut repl,
+            egui::pos2(vertical_x, 600.0),
+            egui::pos2(vertical_x - 80.0, 600.0),
+        );
+        let output = frame(&ctx, &mut repl, vec![]);
+        let moved_x = separator(&output, true).x;
+        assert!(moved_x < vertical_x - 50.0);
+        let moved_y = separator(&output, false).y;
+        output.drop_without_applying_deltas();
+
+        // Drag beyond the limits: neither script editor nor REPL input may disappear.
+        drag(
+            &ctx,
+            &mut repl,
+            egui::pos2(moved_x, 600.0),
+            egui::pos2(-1000.0, 600.0),
+        );
+        drag(
+            &ctx,
+            &mut repl,
+            egui::pos2(400.0, moved_y),
+            egui::pos2(400.0, -1000.0),
+        );
+        let output = frame(&ctx, &mut repl, vec![]);
+        assert!(separator(&output, true).x >= 220.0);
+        assert!(separator(&output, false).y >= 140.0);
         output.drop_without_applying_deltas();
     }
 
