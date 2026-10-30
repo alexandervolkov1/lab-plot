@@ -39,13 +39,23 @@ impl ScriptFile {
     }
 
     pub fn save(&mut self, path: &Path, overwrite: bool) -> Result<(), SaveError> {
+        self.write_content(path, overwrite, &self.text.clone())
+    }
+
+    /// Stage an alternate buffer without changing editor text on failure.
+    pub fn write_content(
+        &mut self,
+        path: &Path,
+        overwrite: bool,
+        content: &str,
+    ) -> Result<(), SaveError> {
         let path = std::path::absolute(path)?;
         // Replace only after the complete UTF-8 buffer has been written successfully.
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Expected a file path"))?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        file.write_all(self.text.as_bytes())?;
+        file.write_all(content.as_bytes())?;
         file.as_file().sync_all()?;
         // Check as late as possible, immediately before the atomic replacement.
         if !overwrite {
@@ -65,7 +75,7 @@ impl ScriptFile {
             }
         }
         file.persist(&path).map_err(|error| error.error)?;
-        self.saved_text.clone_from(&self.text);
+        self.saved_text = content.to_owned();
         self.path = Some(path);
         Ok(())
     }
