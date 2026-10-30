@@ -11,9 +11,11 @@ mod files;
 mod highlight;
 mod indent;
 
-use files::ScriptFile;
+use files::{SaveError, ScriptFile};
 
 const MAX_COMMAND_HISTORY: usize = 200;
+const MAX_HIDDEN_HISTORY: usize = 200;
+const MAX_HISTORY_ENTRY_BYTES: usize = 16 * 1024;
 
 #[derive(Default)]
 struct CommandHistory {
@@ -78,19 +80,22 @@ struct EvalRequest {
     path: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     New,
     Open,
+    Close,
 }
 
 pub struct Repl {
     script: ScriptFile,
     input: String,
-    history: Vec<String>,
+    history: VecDeque<String>,
     last_output: String,
     file_error: Option<String>,
     pending_action: Option<FileAction>,
+    pending_save: Option<PathBuf>,
+    close_allowed: bool,
     reset_script_cursor: bool,
     busy: bool,
     request_tx: Sender<EvalRequest>,
@@ -138,10 +143,12 @@ impl Repl {
         Self {
             script: ScriptFile::default(),
             input: String::new(),
-            history: Vec::new(),
+            history: VecDeque::new(),
             last_output: String::new(),
             file_error: None,
             pending_action: None,
+            pending_save: None,
+            close_allowed: false,
             reset_script_cursor: false,
             busy: false,
             request_tx,
@@ -154,15 +161,15 @@ impl Repl {
         loop {
             match self.response_rx.try_recv() {
                 Ok(result) => {
-                    self.last_output.clone_from(&result);
-                    self.history.push(result);
+                    self.record_history(&result);
+                    self.last_output = result;
                     self.busy = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if self.busy {
                         self.last_output = "Steel Engine unavailable".into();
-                        self.history.push(self.last_output.clone());
+                        self.record_history("Steel Engine unavailable");
                         self.busy = false;
                     }
                     break;
@@ -171,27 +178,50 @@ impl Repl {
         }
     }
 
-    fn submit(&mut self, source: String, path: Option<PathBuf>) -> bool {
+    fn record_history(&mut self, entry: &str) {
+        if self.history.len() == MAX_HIDDEN_HISTORY {
+            self.history.pop_front();
+        }
+        let mut end = entry.len().min(MAX_HISTORY_ENTRY_BYTES);
+        if end < entry.len() {
+            end -= "…".len();
+            while !entry.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.history.push_back(format!("{}…", &entry[..end]));
+        } else {
+            self.history.push_back(entry.to_owned());
+        }
+    }
+
+    fn submit(&mut self, source: String, path: Option<PathBuf>, entry: &str) -> bool {
         if self.busy || source.trim().is_empty() {
             return false;
         }
-        let entry = format!("> {source}");
         if self.request_tx.send(EvalRequest { source, path }).is_err() {
             self.last_output = "Steel Engine unavailable".into();
             return false;
         }
-        self.history.push(entry);
+        self.record_history(entry);
         self.busy = true;
         true
     }
 
     fn run_script(&mut self) {
-        self.submit(self.script.text.clone(), self.script.path.clone());
+        let name = self
+            .script
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "несохранённый буфер".into());
+        let entry = format!("Run script: {name}");
+        self.submit(self.script.text.clone(), self.script.path.clone(), &entry);
     }
 
     fn execute_input(&mut self) {
         let source = self.input.clone();
-        if self.submit(source.clone(), None) {
+        if self.submit(source.clone(), None, &format!("> {source}")) {
             self.command_history.record(&source);
             self.input.clear();
         }
@@ -207,6 +237,7 @@ impl Repl {
 
     fn perform_file_action(&mut self, action: FileAction) {
         match action {
+            FileAction::Close => self.close_allowed = true,
             FileAction::New => {
                 self.script = ScriptFile::default();
                 self.file_error = None;
@@ -247,20 +278,108 @@ impl Repl {
         let Some(path) = path else {
             return false;
         };
-        match self.script.save_as(&path) {
+        self.save_to_path(path, false)
+    }
+
+    fn save_to_path(&mut self, path: PathBuf, overwrite: bool) -> bool {
+        let result = if overwrite {
+            self.script.save(&path, true)
+        } else {
+            self.script.save_as(&path)
+        };
+        match result {
             Ok(()) => {
                 self.file_error = None;
+                self.pending_save = None;
                 true
             }
-            Err(error) => {
+            Err(SaveError::Conflict) => {
+                self.pending_save = Some(path);
+                false
+            }
+            Err(SaveError::Io(error)) => {
                 self.file_error = Some(format!("Save: {error}"));
+                self.pending_save = None;
                 false
             }
         }
     }
 
+    fn complete_pending_action(&mut self) {
+        if let Some(action) = self.pending_action.take() {
+            self.perform_file_action(action);
+        }
+    }
+
+    fn cancel_pending_action(&mut self) {
+        self.pending_action = None;
+        self.pending_save = None;
+    }
+
+    fn overwrite_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.pending_save.clone() else {
+            return;
+        };
+        ui.label(format!(
+            "Файл изменён извне, удалён или выбран другой существующий файл: {}",
+            path.display()
+        ));
+        ui.label("Перезаписать файл содержимым редактора?");
+        ui.horizontal(|ui| {
+            if ui.button("Overwrite").clicked() && self.save_to_path(path, true) {
+                self.complete_pending_action();
+            }
+            if ui.button("Cancel overwrite").clicked() {
+                self.pending_save = None;
+            }
+        });
+    }
+
+    fn request_close(&mut self) -> bool {
+        if self.close_allowed || !self.script.dirty() {
+            return true;
+        }
+        self.pending_action = Some(FileAction::Close);
+        false
+    }
+
+    pub fn close_ui(&mut self, ui: &mut egui::Ui) {
+        if ui.input(|i| i.viewport().close_requested()) && !self.request_close() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.pending_action == Some(FileAction::Close) {
+            egui::Modal::new(egui::Id::unique("unsaved_script_on_exit")).show(ui.ctx(), |ui| {
+                ui.heading("Несохранённый скрипт");
+                if let Some(error) = &self.file_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if self.pending_save.is_some() {
+                    self.overwrite_ui(ui);
+                } else {
+                    ui.label("Сохранить изменения перед закрытием lab-plot?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() && self.save(false) {
+                            self.complete_pending_action();
+                        }
+                        if ui.button("Discard").clicked() {
+                            self.pending_save = None;
+                            self.complete_pending_action();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_pending_action();
+                        }
+                    });
+                }
+            });
+        }
+        if self.close_allowed {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        if self.pending_action.is_none() && ui.input(|i| i.focused) {
+        if self.pending_action.is_none() && self.pending_save.is_none() && ui.input(|i| i.focused) {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
                 self.request_file_action(FileAction::New);
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
@@ -270,28 +389,31 @@ impl Repl {
             }
         }
 
-        ui.add_enabled_ui(self.pending_action.is_none(), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("New").clicked() {
-                    self.request_file_action(FileAction::New);
-                }
-                if ui.button("Open").clicked() {
-                    self.request_file_action(FileAction::Open);
-                }
-                if ui.button("Save").clicked() {
-                    self.save(false);
-                }
-                if ui.button("Save As").clicked() {
-                    self.save(true);
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Run"))
-                    .clicked()
-                {
-                    self.run_script();
-                }
-            });
-        });
+        ui.add_enabled_ui(
+            self.pending_action.is_none() && self.pending_save.is_none(),
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("New").clicked() {
+                        self.request_file_action(FileAction::New);
+                    }
+                    if ui.button("Open").clicked() {
+                        self.request_file_action(FileAction::Open);
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save(false);
+                    }
+                    if ui.button("Save As").clicked() {
+                        self.save(true);
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Run"))
+                        .clicked()
+                    {
+                        self.run_script();
+                    }
+                });
+            },
+        );
         let name = self
             .script
             .path
@@ -307,7 +429,11 @@ impl Repl {
         if let Some(error) = &self.file_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        if let Some(action) = self.pending_action {
+        if self.pending_action != Some(FileAction::Close) && self.pending_save.is_some() {
+            self.overwrite_ui(ui);
+        } else if let Some(action) = self.pending_action
+            && action != FileAction::Close
+        {
             ui.label("Несохранённые изменения. Сохранить перед продолжением?");
             ui.horizontal(|ui| {
                 if ui.button("Save and continue").clicked() && self.save(false) {
@@ -324,31 +450,34 @@ impl Repl {
             });
         }
 
-        ui.add_enabled_ui(self.pending_action.is_none(), |ui| {
-            let height = ui.available_height();
-            egui::Panel::bottom("steel_repl_panel")
-                .resizable(true)
-                .default_size(height * 0.3)
-                .min_size(140.0)
-                .max_size((height - 100.0).max(140.0))
-                .show(ui, |ui| self.repl_ui(ui));
-            egui::CentralPanel::default().show(ui, |ui| {
-                let id = ui.make_persistent_id("steel_script_editor");
-                if self.reset_script_cursor {
-                    egui::text_edit::TextEditState::default().store(ui.ctx(), id);
-                    self.reset_script_cursor = false;
-                }
-                let submit = egui::ScrollArea::vertical()
-                    .id_salt("script_scroll")
-                    .show(ui, |ui| {
-                        code_editor(ui, id, &mut self.script.text, ui.available_height(), None)
-                    })
-                    .inner;
-                if submit {
-                    self.run_script();
-                }
-            });
-        });
+        ui.add_enabled_ui(
+            self.pending_action.is_none() && self.pending_save.is_none(),
+            |ui| {
+                let height = ui.available_height();
+                egui::Panel::bottom("steel_repl_panel")
+                    .resizable(true)
+                    .default_size(height * 0.3)
+                    .min_size(140.0)
+                    .max_size((height - 100.0).max(140.0))
+                    .show(ui, |ui| self.repl_ui(ui));
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let id = ui.make_persistent_id("steel_script_editor");
+                    if self.reset_script_cursor {
+                        egui::text_edit::TextEditState::default().store(ui.ctx(), id);
+                        self.reset_script_cursor = false;
+                    }
+                    let submit = egui::ScrollArea::vertical()
+                        .id_salt("script_scroll")
+                        .show(ui, |ui| {
+                            code_editor(ui, id, &mut self.script.text, ui.available_height(), None)
+                        })
+                        .inner;
+                    if submit {
+                        self.run_script();
+                    }
+                });
+            },
+        );
     }
 
     fn repl_ui(&mut self, ui: &mut egui::Ui) {
@@ -453,6 +582,124 @@ fn code_editor(
 mod tests {
     use super::*;
 
+    #[test]
+    fn dirty_close_is_cancelled_at_viewport_level_and_cancel_keeps_buffer() {
+        let mut repl = Repl::new(|_| {});
+        assert!(repl.request_close());
+        repl.script.text = "unsaved script".into();
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run_ui(raw, |ui| repl.close_ui(ui));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(!repl.close_allowed);
+        assert!(repl.pending_action == Some(FileAction::Close));
+        repl.cancel_pending_action();
+        assert!(repl.pending_action.is_none());
+        assert!(!repl.close_allowed);
+        assert_eq!(repl.script.text, "unsaved script");
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn close_only_proceeds_after_successful_save_or_explicit_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("close.scm");
+        let mut repl = Repl::new(|_| {});
+        repl.script.save_as(&path).unwrap();
+        repl.script.text = "unsaved".into();
+        // Reading a directory as a file fails; it must never count as unchanged.
+        repl.script.path = Some(dir.path().to_owned());
+        assert!(!repl.request_close());
+        assert!(!repl.save(false));
+        assert!(repl.file_error.is_some());
+        assert!(!repl.close_allowed);
+        assert_eq!(repl.script.text, "unsaved");
+        assert!(repl.script.dirty());
+        repl.script.path = Some(path.clone());
+        assert!(repl.save(false));
+        repl.complete_pending_action();
+        assert!(repl.close_allowed);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "unsaved");
+
+        let mut discarded = Repl::new(|_| {});
+        discarded.script.text = "discard me".into();
+        assert!(!discarded.request_close());
+        discarded.complete_pending_action(); // Discard button.
+        assert!(discarded.close_allowed);
+    }
+
+    #[test]
+    fn conflicting_save_keeps_buffer_until_overwrite_is_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.scm");
+        std::fs::write(&path, "original").unwrap();
+        let mut repl = Repl::new(|_| {});
+        repl.script.open(&path).unwrap();
+        repl.script.text = "local edit".into();
+        std::fs::write(&path, "external edit").unwrap();
+        assert!(!repl.save(false));
+        assert!(repl.pending_save.is_some());
+        repl.pending_save = None; // Cancel overwrite.
+        assert_eq!(repl.script.text, "local edit");
+        assert!(repl.script.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
+
+        assert!(!repl.request_close());
+        assert!(!repl.save(false));
+        assert!(!repl.close_allowed);
+        let target = repl.pending_save.clone().unwrap();
+        assert!(repl.save_to_path(target, true));
+        repl.complete_pending_action();
+        assert!(repl.close_allowed);
+        assert!(!repl.script.dirty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "local edit");
+    }
+
+    #[test]
+    fn hidden_history_has_bounded_utf8_entries_and_script_summaries() {
+        let mut repl = Repl::new(|_| {});
+        repl.script.text = format!(";{}", "large script source".repeat(10000));
+        repl.run_script();
+        finish(&mut repl);
+        assert!(
+            repl.history
+                .front()
+                .unwrap()
+                .contains("несохранённый буфер")
+        );
+        assert!(
+            !repl
+                .history
+                .front()
+                .unwrap()
+                .contains("large script source")
+        );
+        let long_result = "🌡температура".repeat(MAX_HISTORY_ENTRY_BYTES);
+        let (tx, rx) = mpsc::channel();
+        repl.response_rx = rx;
+        for _ in 0..MAX_HIDDEN_HISTORY + 5 {
+            tx.send(long_result.clone()).unwrap();
+            repl.poll();
+        }
+        assert_eq!(repl.history.len(), MAX_HIDDEN_HISTORY);
+        assert!(
+            repl.history
+                .iter()
+                .all(|entry| entry.len() <= MAX_HISTORY_ENTRY_BYTES && entry.ends_with('…'))
+        );
+        assert_eq!(repl.last_output, long_result);
+        assert!(repl.command_history.commands.is_empty());
+    }
+
     fn frame(ctx: &egui::Context, repl: &mut Repl, events: Vec<egui::Event>) -> egui::FullOutput {
         ctx.run_ui(
             egui::RawInput {
@@ -521,7 +768,8 @@ mod tests {
         let mut repl = Repl::new(|_| {});
         repl.script.text = "(define retained 42)".into();
         repl.input = "unfinished input".into();
-        repl.history.push("PREVIOUS_RESULT_MUST_BE_HIDDEN".into());
+        repl.history
+            .push_back("PREVIOUS_RESULT_MUST_BE_HIDDEN".into());
         repl.last_output = "LATEST_RESULT_VISIBLE".into();
         let ctx = egui::Context::default();
         for _ in 0..2 {

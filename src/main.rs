@@ -166,6 +166,7 @@ impl eframe::App for LabPlot {
         }
 
         self.repl.poll();
+        self.repl.close_ui(ui);
 
         egui::CentralPanel::default().show(ui, |ui| {
             if ui.button("REPL").clicked() {
