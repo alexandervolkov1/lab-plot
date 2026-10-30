@@ -7,3 +7,5 @@ edition = "2024"
 eframe = { version = "=0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 egui_plot = "=0.38.0"
 steel-core = "=0.8.3"
+rfd = "=0.17.2"
+tempfile = "=3.27.0"

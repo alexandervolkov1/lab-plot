@@ -199,8 +199,9 @@ impl eframe::App for LabPlot {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("steel_repl"),
                 egui::ViewportBuilder::default()
-                    .with_title("Steel REPL")
-                    .with_inner_size([700.0, 450.0]),
+                    .with_title("Steel")
+                    .with_inner_size([800.0, 640.0])
+                    .with_min_inner_size([520.0, 440.0]),
                 |ui, _class| {
                     if ui.ctx().input(|i| i.viewport().close_requested()) {
                         self.repl_visible = false;
