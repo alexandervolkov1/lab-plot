@@ -9,3 +9,4 @@ egui_plot = "=0.38.0"
 steel-core = "=0.8.3"
 rfd = "=0.17.2"
 tempfile = "=3.27.0"
+schemat = { git = "https://github.com/alexandervolkov1/schemat-steel", rev = "4abe84a054ea5e8835b98e165275b44dda981d7b" }

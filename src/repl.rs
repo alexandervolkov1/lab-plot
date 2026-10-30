@@ -94,6 +94,7 @@ pub struct Repl {
     last_output: String,
     scroll_history_to_end: bool,
     file_error: Option<String>,
+    format_message: Option<String>,
     pending_action: Option<FileAction>,
     pending_save: Option<PathBuf>,
     close_allowed: bool,
@@ -144,6 +145,7 @@ impl Repl {
             last_output: String::new(),
             scroll_history_to_end: false,
             file_error: None,
+            format_message: None,
             pending_action: None,
             pending_save: None,
             close_allowed: false,
@@ -243,6 +245,7 @@ impl Repl {
             FileAction::New => {
                 self.script = ScriptFile::default();
                 self.file_error = None;
+                self.format_message = None;
                 self.reset_script_cursor = true;
             }
             FileAction::Open => {
@@ -253,6 +256,7 @@ impl Repl {
                     match self.script.open(&path) {
                         Ok(()) => {
                             self.file_error = None;
+                            self.format_message = None;
                             self.reset_script_cursor = true;
                         }
                         Err(error) => self.file_error = Some(format!("Open: {error}")),
@@ -262,7 +266,7 @@ impl Repl {
         }
     }
 
-    fn save(&mut self, save_as: bool) -> bool {
+    fn save(&mut self, save_as: bool, ctx: &egui::Context) -> bool {
         let path = if save_as || self.script.path.is_none() {
             let mut dialog = rfd::FileDialog::new().add_filter("Steel", &["scm", "ss"]);
             if let Some(path) = &self.script.path {
@@ -280,17 +284,37 @@ impl Repl {
         let Some(path) = path else {
             return false;
         };
-        self.save_to_path(path, false)
+        let saved = self.save_to_path(path, false, ctx);
+        if saved {
+            self.show_save_warning();
+        }
+        saved
     }
 
-    fn save_to_path(&mut self, path: PathBuf, overwrite: bool) -> bool {
-        let result = if overwrite {
-            self.script.save(&path, true)
-        } else {
-            self.script.save_as(&path)
+    fn save_to_path(&mut self, path: PathBuf, overwrite: bool, ctx: &egui::Context) -> bool {
+        let (content, warning) = match schemat::format_string(&self.script.text) {
+            Ok(content) => (content, None),
+            Err(error) => (
+                self.script.text.clone(),
+                Some(format!(
+                    "Сохранён исходный текст без форматирования: {error}"
+                )),
+            ),
         };
-        match result {
+        let saved = if !overwrite && content == self.script.text {
+            self.script.save_as(&path)
+        } else {
+            self.script.write_content(&path, overwrite, &content)
+        };
+        match saved {
             Ok(()) => {
+                replace_editor_text(
+                    ctx,
+                    egui::Id::unique("steel_script_editor"),
+                    &mut self.script.text,
+                    content,
+                );
+                self.format_message = warning;
                 self.file_error = None;
                 self.pending_save = None;
                 true
@@ -304,6 +328,16 @@ impl Repl {
                 self.pending_save = None;
                 false
             }
+        }
+    }
+
+    fn show_save_warning(&self) {
+        if let Some(message) = &self.format_message {
+            rfd::MessageDialog::new()
+                .set_title("Steel: форматирование")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_description(message)
+                .show();
         }
     }
 
@@ -328,7 +362,8 @@ impl Repl {
         ));
         ui.label("Перезаписать файл содержимым редактора?");
         ui.horizontal(|ui| {
-            if ui.button("Overwrite").clicked() && self.save_to_path(path, true) {
+            if ui.button("Overwrite").clicked() && self.save_to_path(path, true, ui.ctx()) {
+                self.show_save_warning();
                 self.complete_pending_action();
             }
             if ui.button("Cancel overwrite").clicked() {
@@ -361,7 +396,7 @@ impl Repl {
                 } else {
                     ui.label("Сохранить изменения перед закрытием lab-plot?");
                     ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() && self.save(false) {
+                        if ui.button("Save").clicked() && self.save(false, ui.ctx()) {
                             self.complete_pending_action();
                         }
                         if ui.button("Discard").clicked() {
@@ -387,7 +422,7 @@ impl Repl {
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
                 self.request_file_action(FileAction::Open);
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
-                self.save(false);
+                self.save(false, ui.ctx());
             }
         }
 
@@ -402,10 +437,10 @@ impl Repl {
                         self.request_file_action(FileAction::Open);
                     }
                     if ui.button("Save").clicked() {
-                        self.save(false);
+                        self.save(false, ui.ctx());
                     }
                     if ui.button("Save As").clicked() {
-                        self.save(true);
+                        self.save(true, ui.ctx());
                     }
                     if ui
                         .add_enabled(!self.busy, egui::Button::new("Run"))
@@ -431,6 +466,9 @@ impl Repl {
         if let Some(error) = &self.file_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+        if let Some(message) = &self.format_message {
+            ui.colored_label(ui.visuals().warn_fg_color, message);
+        }
         if self.pending_action != Some(FileAction::Close) && self.pending_save.is_some() {
             self.overwrite_ui(ui);
         } else if let Some(action) = self.pending_action
@@ -438,7 +476,7 @@ impl Repl {
         {
             ui.label("Несохранённые изменения. Сохранить перед продолжением?");
             ui.horizontal(|ui| {
-                if ui.button("Save and continue").clicked() && self.save(false) {
+                if ui.button("Save and continue").clicked() && self.save(false, ui.ctx()) {
                     self.pending_action = None;
                     self.perform_file_action(action);
                 }
@@ -463,7 +501,7 @@ impl Repl {
                     .max_size((height - 140.0).max(140.0))
                     .show(ui, |ui| self.repl_ui(ui));
                 egui::CentralPanel::default().show(ui, |ui| {
-                    let id = ui.make_persistent_id("steel_script_editor");
+                    let id = egui::Id::unique("steel_script_editor");
                     if self.reset_script_cursor {
                         egui::text_edit::TextEditState::default().store(ui.ctx(), id);
                         self.reset_script_cursor = false;
@@ -471,7 +509,14 @@ impl Repl {
                     let submit = egui::ScrollArea::vertical()
                         .id_salt("script_scroll")
                         .show(ui, |ui| {
-                            code_editor(ui, id, &mut self.script.text, ui.available_height(), None)
+                            code_editor(
+                                ui,
+                                id,
+                                &mut self.script.text,
+                                ui.available_height(),
+                                None,
+                                &mut self.format_message,
+                            )
                         })
                         .inner;
                     if submit {
@@ -533,7 +578,14 @@ impl Repl {
             .id_salt("repl_input_scroll")
             .max_height(input_height)
             .show(ui, |ui| {
-                code_editor(ui, id, &mut self.input, input_height, cursor)
+                code_editor(
+                    ui,
+                    id,
+                    &mut self.input,
+                    input_height,
+                    cursor,
+                    &mut self.format_message,
+                )
             })
             .inner;
         ui.horizontal(|ui| {
@@ -551,6 +603,61 @@ impl Repl {
     }
 }
 
+// Keep selection direction, mapping by non-whitespace characters rather than byte offsets.
+fn mapped_cursor(old: &str, new: &str, index: usize) -> usize {
+    if index >= old.chars().count() {
+        return new.chars().count();
+    }
+    let count = old
+        .chars()
+        .take(index)
+        .filter(|ch| !ch.is_whitespace())
+        .count();
+    let in_space = old.chars().nth(index).is_some_and(char::is_whitespace);
+    if count == 0 && in_space {
+        return 0;
+    }
+    let mut seen = 0;
+    for (position, ch) in new.chars().enumerate() {
+        if !ch.is_whitespace() {
+            if !in_space && seen == count {
+                return position;
+            }
+            seen += 1;
+            if in_space && seen == count {
+                return position + 1;
+            }
+        }
+    }
+    new.chars().count()
+}
+
+fn replace_editor_text(ctx: &egui::Context, id: egui::Id, text: &mut String, formatted: String) {
+    if *text == formatted {
+        return;
+    }
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let range = state.cursor.char_range().unwrap_or_else(|| {
+        egui::text::CCursorRange::one(egui::text::CCursor::new(text.chars().count()))
+    });
+    let mut mapped = range;
+    mapped.primary.index = mapped_cursor(text, &formatted, range.primary.index.0).into();
+    mapped.secondary.index = mapped_cursor(text, &formatted, range.secondary.index.0).into();
+    mapped.h_pos = None;
+    let now = ctx.input(|i| i.time);
+    let mut undoer = state.undoer();
+    let before = (range, text.clone());
+    undoer.feed_state(now, &before);
+    undoer.add_undo(&before);
+    let after = (mapped, formatted.clone());
+    undoer.feed_state(now, &after);
+    undoer.add_undo(&after);
+    state.set_undoer(undoer);
+    state.cursor.set_char_range(Some(mapped));
+    state.store(ctx, id);
+    *text = formatted;
+}
+
 /// Shared editing behavior, with distinct buffers, widget IDs and undo states.
 fn code_editor(
     ui: &mut egui::Ui,
@@ -558,10 +665,24 @@ fn code_editor(
     text: &mut String,
     height: f32,
     cursor: Option<usize>,
+    format_message: &mut Option<String>,
 ) -> bool {
     let focused = ui.is_enabled() && ui.memory(|m| m.has_focus(id)) && ui.input(|i| i.focused);
     let submit =
         focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
+    if focused
+        && ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::F)
+        })
+    {
+        match schemat::format_string(text) {
+            Ok(formatted) => {
+                replace_editor_text(ui.ctx(), id, text, formatted);
+                *format_message = None;
+            }
+            Err(error) => *format_message = Some(format!("Format: {error}")),
+        }
+    }
     if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
         if let Some(cursor) = cursor {
             state
@@ -587,7 +708,14 @@ fn code_editor(
         state.store(ui.ctx(), id);
     }
     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
-        let mut job = highlight::highlight(text.as_str());
+        let cursor = if focused {
+            egui::TextEdit::load_state(ui.ctx(), id)
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| range.primary.index.0)
+        } else {
+            None
+        };
+        let mut job = highlight::highlight_with_cursor(text.as_str(), cursor);
         job.wrap.max_width = width;
         ui.fonts_mut(|fonts| fonts.layout_job(job))
     };
@@ -606,6 +734,189 @@ fn code_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_shortcut() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                shift: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn edit_frame(
+        ctx: &egui::Context,
+        id: egui::Id,
+        text: &mut String,
+        events: Vec<egui::Event>,
+        message: &mut Option<String>,
+    ) {
+        ctx.memory_mut(|m| m.request_focus(id));
+        ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(!code_editor(ui, id, text, 100.0, None, message));
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn formatting_is_one_undo_step_and_keeps_earlier_undo() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("format_undo");
+        let original = "(define x 1)\n";
+        let edited = "(  define   x  2 )";
+        let mut text = original.to_owned();
+        let mut message = None;
+        edit_frame(&ctx, id, &mut text, vec![], &mut message);
+        edit_frame(
+            &ctx,
+            id,
+            &mut text,
+            vec![ctrl(egui::Key::A), egui::Event::Paste(edited.into())],
+            &mut message,
+        );
+        assert_eq!(text, edited);
+        edit_frame(&ctx, id, &mut text, vec![format_shortcut()], &mut message);
+        assert_eq!(text, "(define x 2)\n");
+        assert!(message.is_none());
+        edit_frame(&ctx, id, &mut text, vec![format_shortcut()], &mut message);
+        edit_frame(&ctx, id, &mut text, vec![ctrl(egui::Key::Z)], &mut message);
+        assert_eq!(text, edited);
+        edit_frame(&ctx, id, &mut text, vec![ctrl(egui::Key::Z)], &mut message);
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn formatter_errors_keep_text_and_editor_cursors_are_independent() {
+        let ctx = egui::Context::default();
+        let script_id = egui::Id::unique("format_script");
+        let input_id = egui::Id::unique("format_input");
+        let mut script = "( define  имя   10 )".to_owned();
+        let mut input = "(define (unfinished".to_owned();
+        let mut message = None;
+        edit_frame(&ctx, script_id, &mut script, vec![], &mut message);
+        let mut state = egui::TextEdit::load_state(&ctx, script_id).unwrap();
+        // Select the Cyrillic identifier, preserving selection direction after whitespace changes.
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(10),
+                egui::text::CCursor::new(13),
+            )));
+        state.store(&ctx, script_id);
+        edit_frame(
+            &ctx,
+            script_id,
+            &mut script,
+            vec![format_shortcut()],
+            &mut message,
+        );
+        let range = egui::TextEdit::load_state(&ctx, script_id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        let selected: String = script
+            .chars()
+            .skip(range.as_sorted_char_range().start.0)
+            .take(range.as_sorted_char_range().end.0 - range.as_sorted_char_range().start.0)
+            .collect();
+        assert_eq!(selected, "имя");
+        let prior = range;
+        edit_frame(&ctx, input_id, &mut input, vec![], &mut message);
+        edit_frame(
+            &ctx,
+            input_id,
+            &mut input,
+            vec![format_shortcut()],
+            &mut message,
+        );
+        assert!(message.is_some());
+        assert_eq!(input, "(define (unfinished");
+        assert_eq!(
+            egui::TextEdit::load_state(&ctx, script_id)
+                .unwrap()
+                .cursor
+                .char_range()
+                .unwrap(),
+            prior
+        );
+        input = "( +  1  2 )".into();
+        edit_frame(
+            &ctx,
+            input_id,
+            &mut input,
+            vec![format_shortcut()],
+            &mut message,
+        );
+        assert_eq!(input, "(+ 1 2)\n");
+        assert_eq!(script, "(define имя 10)\n");
+    }
+
+    #[test]
+    fn save_formats_only_after_success_and_undo_restores_dirty_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("format-save.scm");
+        let ctx = egui::Context::default();
+        let mut repl = Repl::new(|_| {});
+        let raw = "(  define  имя   1 )";
+        repl.script.text = raw.into();
+        repl.script.save_as(&path).unwrap();
+        frame(&ctx, &mut repl, vec![]).drop_without_applying_deltas();
+        assert!(repl.save_to_path(path.clone(), false, &ctx));
+        assert_eq!(repl.script.text, "(define имя 1)\n");
+        assert!(!repl.script.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repl.script.text);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("steel_script_editor")));
+        frame(&ctx, &mut repl, vec![ctrl(egui::Key::Z)]).drop_without_applying_deltas();
+        assert_eq!(repl.script.text, raw);
+        assert!(repl.script.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "(define имя 1)\n");
+        repl.script.text = "(define unfinished".into();
+        assert!(repl.save_to_path(path.clone(), false, &ctx));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "(define unfinished");
+        assert_eq!(repl.script.text, "(define unfinished");
+        assert!(repl.format_message.is_some());
+        assert!(!repl.script.dirty());
+        assert!(!repl.busy);
+        assert!(repl.history.is_empty());
+    }
+
+    #[test]
+    fn conflicting_or_failed_save_never_applies_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.scm");
+        let ctx = egui::Context::default();
+        let mut repl = Repl::new(|_| {});
+        repl.script.save_as(&path).unwrap();
+        let raw = "( +  1   2 )";
+        repl.script.text = raw.into();
+        std::fs::write(&path, "; external change").unwrap();
+        assert!(!repl.save_to_path(path.clone(), false, &ctx));
+        repl.pending_save = None; // Cancel overwrite.
+        assert_eq!(repl.script.text, raw);
+        assert!(repl.script.dirty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "; external change");
+        assert!(!repl.save_to_path(dir.path().join("missing/file.scm"), false, &ctx));
+        assert_eq!(repl.script.text, raw);
+        assert!(repl.script.dirty());
+    }
 
     #[test]
     fn void_success_values_and_errors_are_recorded_in_existing_history() {
@@ -680,16 +991,19 @@ mod tests {
         // Reading a directory as a file fails; it must never count as unchanged.
         repl.script.path = Some(dir.path().to_owned());
         assert!(!repl.request_close());
-        assert!(!repl.save(false));
+        assert!(!repl.save(false, &egui::Context::default()));
         assert!(repl.file_error.is_some());
         assert!(!repl.close_allowed);
         assert_eq!(repl.script.text, "unsaved");
         assert!(repl.script.dirty());
         repl.script.path = Some(path.clone());
-        assert!(repl.save(false));
+        assert!(repl.save(false, &egui::Context::default()));
         repl.complete_pending_action();
         assert!(repl.close_allowed);
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "unsaved");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            schemat::format_string("unsaved").unwrap()
+        );
 
         let mut discarded = Repl::new(|_| {});
         discarded.script.text = "discard me".into();
@@ -707,7 +1021,7 @@ mod tests {
         repl.script.open(&path).unwrap();
         repl.script.text = "local edit".into();
         std::fs::write(&path, "external edit").unwrap();
-        assert!(!repl.save(false));
+        assert!(!repl.save(false, &egui::Context::default()));
         assert!(repl.pending_save.is_some());
         repl.pending_save = None; // Cancel overwrite.
         assert_eq!(repl.script.text, "local edit");
@@ -715,14 +1029,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
 
         assert!(!repl.request_close());
-        assert!(!repl.save(false));
+        assert!(!repl.save(false, &egui::Context::default()));
         assert!(!repl.close_allowed);
         let target = repl.pending_save.clone().unwrap();
-        assert!(repl.save_to_path(target, true));
+        assert!(repl.save_to_path(target, true, &egui::Context::default()));
         repl.complete_pending_action();
         assert!(repl.close_allowed);
         assert!(!repl.script.dirty());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "local edit");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            schemat::format_string("local edit").unwrap()
+        );
     }
 
     #[test]
@@ -798,7 +1115,7 @@ mod tests {
         let path = dir.path().join("keyboard.scm");
         let mut repl = Repl::new(|_| {});
         repl.script.save_as(&path).unwrap();
-        repl.script.text = "; несохранённый скрипт".into();
+        repl.script.text = "; несохранённый скрипт\n".into();
         let ctx = egui::Context::default();
         frame(&ctx, &mut repl, vec![]).drop_without_applying_deltas();
         frame(&ctx, &mut repl, vec![ctrl(egui::Key::S)]).drop_without_applying_deltas();
@@ -961,8 +1278,8 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    submitted[0] = code_editor(ui, script_id, &mut script, 100.0, None);
-                    submitted[1] = code_editor(ui, repl_id, &mut input, 100.0, None);
+                    submitted[0] = code_editor(ui, script_id, &mut script, 100.0, None, &mut None);
+                    submitted[1] = code_editor(ui, repl_id, &mut input, 100.0, None, &mut None);
                 },
             )
             .drop_without_applying_deltas();
