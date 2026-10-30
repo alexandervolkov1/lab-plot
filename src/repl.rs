@@ -94,7 +94,8 @@ pub struct Repl {
     last_output: String,
     scroll_history_to_end: bool,
     file_error: Option<String>,
-    format_message: Option<String>,
+    script_format_message: Option<String>,
+    repl_format_message: Option<String>,
     pending_action: Option<FileAction>,
     pending_save: Option<PathBuf>,
     close_allowed: bool,
@@ -145,7 +146,8 @@ impl Repl {
             last_output: String::new(),
             scroll_history_to_end: false,
             file_error: None,
-            format_message: None,
+            script_format_message: None,
+            repl_format_message: None,
             pending_action: None,
             pending_save: None,
             close_allowed: false,
@@ -245,7 +247,7 @@ impl Repl {
             FileAction::New => {
                 self.script = ScriptFile::default();
                 self.file_error = None;
-                self.format_message = None;
+                self.script_format_message = None;
                 self.reset_script_cursor = true;
             }
             FileAction::Open => {
@@ -256,7 +258,7 @@ impl Repl {
                     match self.script.open(&path) {
                         Ok(()) => {
                             self.file_error = None;
-                            self.format_message = None;
+                            self.script_format_message = None;
                             self.reset_script_cursor = true;
                         }
                         Err(error) => self.file_error = Some(format!("Open: {error}")),
@@ -314,7 +316,7 @@ impl Repl {
                     &mut self.script.text,
                     content,
                 );
-                self.format_message = warning;
+                self.script_format_message = warning;
                 self.file_error = None;
                 self.pending_save = None;
                 true
@@ -332,7 +334,7 @@ impl Repl {
     }
 
     fn show_save_warning(&self) {
-        if let Some(message) = &self.format_message {
+        if let Some(message) = &self.script_format_message {
             rfd::MessageDialog::new()
                 .set_title("Steel: форматирование")
                 .set_level(rfd::MessageLevel::Warning)
@@ -466,7 +468,7 @@ impl Repl {
         if let Some(error) = &self.file_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        if let Some(message) = &self.format_message {
+        if let Some(message) = &self.script_format_message {
             ui.colored_label(ui.visuals().warn_fg_color, message);
         }
         if self.pending_action != Some(FileAction::Close) && self.pending_save.is_some() {
@@ -515,7 +517,7 @@ impl Repl {
                                 &mut self.script.text,
                                 ui.available_height(),
                                 None,
-                                &mut self.format_message,
+                                &mut self.script_format_message,
                             )
                         })
                         .inner;
@@ -562,6 +564,9 @@ impl Repl {
     fn repl_input_ui(&mut self, ui: &mut egui::Ui) {
         ui.set_min_height(ui.available_height());
         ui.strong("REPL");
+        if let Some(message) = &self.repl_format_message {
+            ui.colored_label(ui.visuals().warn_fg_color, message);
+        }
         let id = ui.make_persistent_id("steel_repl_input");
         let focused = ui.is_enabled() && ui.memory(|m| m.has_focus(id)) && ui.input(|i| i.focused);
         let mut moved = false;
@@ -584,7 +589,7 @@ impl Repl {
                     &mut self.input,
                     input_height,
                     cursor,
-                    &mut self.format_message,
+                    &mut self.repl_format_message,
                 )
             })
             .inner;
@@ -734,6 +739,96 @@ fn code_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatting_messages_belong_to_their_editor_and_script_saves() {
+        let ctx = egui::Context::default();
+        let mut repl = Repl::new(|_| {});
+        let script_id = egui::Id::unique("steel_script_editor");
+        repl.script.text = "(define upper".into();
+        repl.input = "(define lower".into();
+        frame(&ctx, &mut repl, vec![]).drop_without_applying_deltas();
+        ctx.memory_mut(|m| m.request_focus(script_id));
+        frame(&ctx, &mut repl, vec![format_shortcut()]).drop_without_applying_deltas();
+        let script_error = repl.script_format_message.clone().unwrap();
+        assert!(repl.repl_format_message.is_none());
+
+        // Focus the actual lower TextEdit, so the test covers the production UI wiring.
+        let pos = egui::pos2(40.0, 520.0);
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &mut repl,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        }
+        let repl_id = ctx.memory(|m| m.focused()).unwrap();
+        assert_ne!(repl_id, script_id);
+        frame(&ctx, &mut repl, vec![format_shortcut()]).drop_without_applying_deltas();
+        let repl_error = repl.repl_format_message.clone().unwrap();
+        assert_eq!(
+            repl.script_format_message.as_deref(),
+            Some(script_error.as_str())
+        );
+
+        let output = frame(&ctx, &mut repl, vec![]);
+        let message_y = |message: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text == message
+                    {
+                        Some(text.pos.y)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap()
+        };
+        assert!(message_y(&script_error) < message_y(&repl_error));
+        output.drop_without_applying_deltas();
+
+        repl.script.text = "( + 1 2 )".into();
+        ctx.memory_mut(|m| m.request_focus(script_id));
+        frame(&ctx, &mut repl, vec![format_shortcut()]).drop_without_applying_deltas();
+        assert!(repl.script_format_message.is_none());
+        assert_eq!(
+            repl.repl_format_message.as_deref(),
+            Some(repl_error.as_str())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        repl.script.text = "(define incomplete".into();
+        assert!(repl.save_to_path(dir.path().join("incomplete.scm"), false, &ctx));
+        let save_warning = repl.script_format_message.clone().unwrap();
+        assert!(save_warning.starts_with("Сохранён исходный текст"));
+        assert_eq!(
+            repl.repl_format_message.as_deref(),
+            Some(repl_error.as_str())
+        );
+
+        repl.input = "( + 3 4 )".into();
+        ctx.memory_mut(|m| m.request_focus(repl_id));
+        frame(&ctx, &mut repl, vec![format_shortcut()]).drop_without_applying_deltas();
+        assert!(repl.repl_format_message.is_none());
+        assert_eq!(
+            repl.script_format_message.as_deref(),
+            Some(save_warning.as_str())
+        );
+        assert_eq!(repl.input, "(+ 3 4)\n");
+        assert!(!repl.busy);
+    }
 
     fn format_shortcut() -> egui::Event {
         egui::Event::Key {
@@ -892,7 +987,7 @@ mod tests {
         assert!(repl.save_to_path(path.clone(), false, &ctx));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "(define unfinished");
         assert_eq!(repl.script.text, "(define unfinished");
-        assert!(repl.format_message.is_some());
+        assert!(repl.script_format_message.is_some());
         assert!(!repl.script.dirty());
         assert!(!repl.busy);
         assert!(repl.history.is_empty());
