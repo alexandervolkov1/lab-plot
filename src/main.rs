@@ -1,11 +1,139 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
-use egui_plot::Plot;
+use egui_plot::{Legend, Line, Plot, PlotPoints};
 use steel::SteelVal;
 use steel::steel_vm::engine::Engine;
+use steel::steel_vm::register_fn::RegisterFn;
+
+const MAX_POINTS: usize = 10_000;
+
+enum PlotCommand {
+    Add { name: String, unit: String },
+    Point { name: String, time: f64, value: f64 },
+    Clear { name: String },
+}
+
+struct PlotSeries {
+    unit: String,
+    points: VecDeque<[f64; 2]>,
+    color: egui::Color32,
+}
+
+#[derive(Default)]
+struct PlotState {
+    series: BTreeMap<String, PlotSeries>,
+}
+
+fn series_color(index: usize) -> egui::Color32 {
+    use egui::Color32;
+
+    let colors = [
+        Color32::from_rgb(115, 208, 255), // голубой
+        Color32::from_rgb(186, 230, 126), // зелёный
+        Color32::from_rgb(255, 204, 102), // жёлтый
+        Color32::from_rgb(212, 191, 255), // фиолетовый
+        Color32::from_rgb(242, 135, 121), // красный
+    ];
+
+    colors[index % colors.len()]
+}
+
+impl PlotState {
+    fn apply(&mut self, command: PlotCommand) {
+        match command {
+            PlotCommand::Add { name, unit } => {
+                if let Some(series) = self.series.get_mut(&name) {
+                    series.unit = unit;
+                } else {
+                    self.series.insert(
+                        name,
+                        PlotSeries {
+                            unit,
+                            points: VecDeque::new(),
+                            color: series_color(self.series.len()),
+                        },
+                    );
+                }
+            }
+
+            PlotCommand::Point { name, time, value } => {
+                let color = series_color(self.series.len());
+
+                let series = self.series.entry(name).or_insert_with(|| PlotSeries {
+                    unit: String::new(),
+                    points: VecDeque::new(),
+                    color,
+                });
+
+                if series.points.len() >= MAX_POINTS {
+                    series.points.pop_front();
+                }
+
+                series.points.push_back([time, value]);
+            }
+
+            PlotCommand::Clear { name } => {
+                if let Some(series) = self.series.get_mut(&name) {
+                    series.points.clear();
+                }
+            }
+        }
+    }
+}
+
+fn register_plot_functions(engine: &mut Engine, sender: Sender<PlotCommand>) {
+    let tx = sender.clone();
+
+    engine.register_fn(
+        "plot/add!",
+        move |name: String, unit: String| -> Result<bool, String> {
+            if name.trim().is_empty() {
+                return Err("Series name cannot be empty".into());
+            }
+
+            tx.send(PlotCommand::Add { name, unit })
+                .map_err(|_| "Plot unavailable".to_string())?;
+
+            Ok(true)
+        },
+    );
+
+    let tx = sender.clone();
+
+    engine.register_fn(
+        "plot/point!",
+        move |name: String, time: f64, value: f64| -> Result<bool, String> {
+            if name.trim().is_empty() {
+                return Err("Series name cannot be empty".into());
+            }
+
+            if !time.is_finite() || !value.is_finite() {
+                return Err("Time and value must be finite".into());
+            }
+
+            tx.send(PlotCommand::Point { name, time, value })
+                .map_err(|_| "Plot unavailable".to_string())?;
+
+            Ok(true)
+        },
+    );
+
+    engine.register_fn("plot/clear!", move |name: String| -> Result<bool, String> {
+        if name.trim().is_empty() {
+            return Err("Series name cannot be empty".into());
+        }
+
+        sender
+            .send(PlotCommand::Clear { name })
+            .map_err(|_| "Plot unavailable".to_string())?;
+
+        Ok(true)
+    });
+}
 
 struct LabPlot {
     input: String,
@@ -14,15 +142,19 @@ struct LabPlot {
     repl_visible: bool,
     request_tx: Sender<String>,
     response_rx: Receiver<String>,
+    plot_rx: Receiver<PlotCommand>,
+    plots: PlotState,
 }
 
 impl LabPlot {
     fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel::<String>();
         let (response_tx, response_rx) = mpsc::channel::<String>();
+        let (plot_tx, plot_rx) = mpsc::channel::<PlotCommand>();
 
         thread::spawn(move || {
             let mut engine = Engine::new();
+            register_plot_functions(&mut engine, plot_tx);
 
             while let Ok(source) = request_rx.recv() {
                 let result = engine.compile_and_run_raw_program(source);
@@ -59,6 +191,8 @@ impl LabPlot {
             repl_visible: true,
             request_tx,
             response_rx,
+            plot_rx,
+            plots: PlotState::default(),
         }
     }
 
@@ -111,6 +245,10 @@ impl LabPlot {
 
 impl eframe::App for LabPlot {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        while let Ok(command) = self.plot_rx.try_recv() {
+            self.plots.apply(command);
+        }
+
         while let Ok(result) = self.response_rx.try_recv() {
             self.history.push(result);
             self.busy = false;
@@ -123,7 +261,27 @@ impl eframe::App for LabPlot {
                 self.repl_visible = true;
             }
 
-            Plot::new("main_plot").show(ui, |_plot_ui| {});
+            ui.label(format!("Кривых: {}", self.plots.series.len()));
+
+            Plot::new("main_plot")
+                .legend(Legend::default())
+                .show(ui, |plot_ui| {
+                    for (name, series) in &self.plots.series {
+                        if series.points.is_empty() {
+                            continue;
+                        }
+
+                        let points: PlotPoints = series.points.iter().copied().collect();
+
+                        let label = if series.unit.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name} [{}]", series.unit)
+                        };
+
+                        plot_ui.line(Line::new(label, points).color(series.color));
+                    }
+                });
         });
 
         if self.repl_visible {
@@ -207,4 +365,52 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_point_and_clear_series() {
+        let mut state = PlotState::default();
+
+        state.apply(PlotCommand::Add {
+            name: "sample".into(),
+            unit: "degC".into(),
+        });
+
+        state.apply(PlotCommand::Point {
+            name: "sample".into(),
+            time: 1.0,
+            value: 25.0,
+        });
+
+        assert_eq!(state.series["sample"].points.len(), 1);
+        assert_eq!(state.series["sample"].unit, "degC");
+
+        state.apply(PlotCommand::Clear {
+            name: "sample".into(),
+        });
+
+        assert!(state.series["sample"].points.is_empty());
+    }
+
+    #[test]
+    fn point_history_is_bounded() {
+        let mut state = PlotState::default();
+
+        for i in 0..MAX_POINTS + 5 {
+            state.apply(PlotCommand::Point {
+                name: "sample".into(),
+                time: i as f64,
+                value: i as f64,
+            });
+        }
+
+        let points = &state.series["sample"].points;
+
+        assert_eq!(points.len(), MAX_POINTS);
+        assert_eq!(points.front().unwrap()[0], 5.0);
+    }
 }
