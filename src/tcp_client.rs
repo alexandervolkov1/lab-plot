@@ -1,5 +1,8 @@
 use serde_json::{Value, json};
 
+mod protocol;
+pub use protocol::*;
+
 pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +31,21 @@ pub enum EncodeError {
 pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError> {
     if id == 0 {
         return Err(EncodeError::InvalidId);
+    }
+
+    // Bound temporary serialization allocations as well as the resulting frame.
+    let payload_size = match request {
+        Request::Get { key } | Request::Set { key, .. } => key.len(),
+        Request::Subscribe { keys } | Request::Unsubscribe { keys } => keys
+            .iter()
+            .try_fold(0usize, |size, key| {
+                size.checked_add(key.len().saturating_add(3))
+            })
+            .unwrap_or(usize::MAX),
+        _ => 0,
+    };
+    if payload_size > MAX_REQUEST_FRAME_BYTES {
+        return Err(EncodeError::FrameTooLong);
     }
 
     let message = match request {
@@ -205,7 +223,7 @@ mod tests {
 
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     EmptyFrame,
     FrameTooLong,

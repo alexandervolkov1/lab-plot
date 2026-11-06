@@ -2848,6 +2848,7 @@ dependencies = [
  "egui_plot",
  "rfd",
  "schemat",
+ "serde",
  "serde_json",
  "steel-core",
  "tempfile",
