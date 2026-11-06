@@ -382,8 +382,10 @@ impl Repl {
         false
     }
 
-    pub fn close_ui(&mut self, ui: &mut egui::Ui) {
-        if ui.input(|i| i.viewport().close_requested()) && !self.request_close() {
+    pub fn close_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let requested = ui.input(|i| i.viewport().close_requested());
+        let accepted = requested && self.request_close();
+        if requested && !accepted {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -415,6 +417,10 @@ impl Repl {
         if self.close_allowed {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if accepted {
+            self.close_allowed = true;
+        }
+        self.close_allowed
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -1061,7 +1067,9 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run_ui(raw, |ui| repl.close_ui(ui));
+        let output = ctx.run_ui(raw, |ui| {
+            repl.close_ui(ui);
+        });
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
@@ -1403,7 +1411,8 @@ mod tests {
 
     #[test]
     fn script_and_repl_share_engine_but_keep_independent_buffers() {
-        let (tx, rx) = mpsc::channel();
+        let mut connection = lab_plot::integration::Integration::default();
+        let tx = connection.sender();
         let mut repl = Repl::new(move |engine| crate::register_plot_functions(engine, tx));
         let source = "(define (square x) (* x x))\n(plot/add! \"sample\" \"degC\")\n(plot/point! \"sample\" 0.0 20.0)";
         repl.script.text = source.into();
@@ -1422,10 +1431,10 @@ mod tests {
         repl.input = "(plot/point! \"sample\" 1.0 (square 5.0))".into();
         repl.execute_input();
         finish(&mut repl);
-        let commands: Vec<_> = rx.try_iter().collect();
-        assert_eq!(commands.len(), 3);
-        assert!(matches!(&commands[0], crate::PlotCommand::Add { name, .. } if name == "sample"));
-        assert!(matches!(&commands[2], crate::PlotCommand::Point { value, .. } if *value == 25.0));
+        let mut plots = crate::PlotState::default();
+        connection.update(&mut plots);
+        assert_eq!(plots.series["sample"].points.len(), 2);
+        assert_eq!(plots.series["sample"].points[1].xy[1], 25.0);
         repl.input = "draft".into();
         assert!(repl.command_history.previous(&mut repl.input));
         assert!(repl.input.starts_with("(plot/point!"));

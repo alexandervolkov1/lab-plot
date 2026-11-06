@@ -1,61 +1,15 @@
 use lab_plot::tcp_client::*;
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::Write,
+    net::{SocketAddr, TcpListener},
     sync::{Arc, Barrier, mpsc},
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
-const WAIT: Duration = Duration::from_secs(5);
-
-fn mock(
-    action: impl FnOnce(BufReader<TcpStream>) + Send + 'static,
-) -> (SocketAddr, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let handle = thread::spawn(move || {
-        let start = Instant::now();
-        let socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(start.elapsed() < WAIT, "accept timeout");
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        // Windows inherits the listener's nonblocking mode on accepted sockets.
-        socket.set_nonblocking(false).unwrap();
-        socket.set_read_timeout(Some(WAIT)).unwrap();
-        socket.set_write_timeout(Some(WAIT)).unwrap();
-        action(BufReader::new(socket));
-    });
-    (address, handle)
-}
-fn read(reader: &mut BufReader<TcpStream>) -> Value {
-    let mut line = String::new();
-    assert!(reader.read_line(&mut line).unwrap() > 0, "unexpected EOF");
-    serde_json::from_str(&line).unwrap()
-}
-fn send(reader: &mut BufReader<TcpStream>, value: Value) {
-    writeln!(reader.get_mut(), "{value}").unwrap();
-}
-fn hello(reader: &mut BufReader<TcpStream>) {
-    assert_eq!(read(reader), json!({"id":1,"op":"hello"}));
-    send(
-        reader,
-        json!({"id":1,"status":"ok","protocol":"lab-server","version":1}),
-    );
-}
-fn until_closed(reader: &mut BufReader<TcpStream>) {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).unwrap();
-    assert!(bytes.is_empty(), "unexpected extra requests: {bytes:?}");
-}
+mod support;
+use support::*;
 fn event(client: &Client) -> ClientEvent {
     let start = Instant::now();
     loop {
