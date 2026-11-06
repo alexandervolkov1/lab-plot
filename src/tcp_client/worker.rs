@@ -215,6 +215,10 @@ impl Client {
     pub fn sender(&self) -> ClientSender {
         self.sender.clone()
     }
+    /// Poll worker completion before dropping/joining from an interactive thread.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
     /// Available independently of the event queue, including on overflow.
     pub fn state(&self) -> ClientState {
         lock(&self.sender.shared).state.clone()
