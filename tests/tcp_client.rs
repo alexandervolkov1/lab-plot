@@ -57,6 +57,68 @@ fn measurement(key: &str, value: Value) -> Value {
 }
 
 #[test]
+fn boolean_describe_and_get_results_keep_one_ready_connection() {
+    let (address, server) = mock(|mut socket| {
+        hello(&mut socket);
+        assert_eq!(read(&mut socket), json!({"id":2,"op":"describe"}));
+        send(
+            &mut socket,
+            json!({"id":2,"status":"ok","parameters":[{"key":"enabled","type":"boolean","min":null,"max":null,"unit":"","writable":true,"poll_period_ns":null}]}),
+        );
+        for (id, value) in [(3, true), (4, false)] {
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":id,"op":"get","key":"enabled"})
+            );
+            send(
+                &mut socket,
+                json!({"id":id,"status":"ok","key":"enabled","value":value,"unit":"","completed_at_unix_ms":1000+id}),
+            );
+        }
+        until_closed(&mut socket);
+    });
+    let mut client = ready(address, ClientOptions::default());
+    client.sender().request(Request::Describe).unwrap();
+    let ClientEvent::Response(Response {
+        id: 2,
+        data: ResponseData::Parameters(parameters),
+    }) = event(&client)
+    else {
+        panic!()
+    };
+    assert_eq!(parameters[0].value_type, ScalarType::Boolean);
+    assert_eq!((parameters[0].min, parameters[0].max), (None, None));
+    for (id, value) in [(3, true), (4, false)] {
+        assert_eq!(
+            client
+                .sender()
+                .request(Request::Get {
+                    key: "enabled".into()
+                })
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            event(&client),
+            ClientEvent::Response(Response {
+                id,
+                data: ResponseData::Measurement(Measurement {
+                    key: "enabled".into(),
+                    completed_at_unix_ms: 1000 + id,
+                    reading: Reading::Value {
+                        value: ScalarValue::Boolean(value),
+                        unit: String::new()
+                    }
+                })
+            })
+        );
+    }
+    assert_eq!(client.state(), ClientState::Ready);
+    client.shutdown();
+    server.join().unwrap();
+}
+
+#[test]
 fn hello_is_required_and_version_is_checked() {
     for (protocol, version) in [("lab-server", 2), ("wrong", 1)] {
         let (seen_tx, seen_rx) = mpsc::sync_channel(1);

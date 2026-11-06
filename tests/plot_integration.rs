@@ -59,6 +59,17 @@ fn close(connection: &mut Integration, plots: &mut PlotState) {
     pump(connection, plots, |c, _| c.is_closed());
 }
 
+fn has_result(connection: &Integration, id: u64) -> bool {
+    connection
+        .journal
+        .iter()
+        .any(|entry| entry.request_id() == Some(id))
+}
+
+fn observation(key: &str, value: serde_json::Value, time: u64) -> serde_json::Value {
+    json!({"event":"measurement","status":"ok","key":key,"value":value,"unit":"","completed_at_unix_ms":time})
+}
+
 // Evaluate on a real separate Engine thread. A withheld server ACK cannot be
 // released until eval returns, so the async assertions don't rely on timing.
 type EvalReply = mpsc::SyncSender<Result<Vec<String>, String>>;
@@ -815,4 +826,473 @@ fn event_overflow_is_reported_even_before_gui_drains_events() {
             .unwrap()
             .contains("EventQueueOverflow")
     );
+}
+
+#[test]
+fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
+    let (gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (seen_tx, seen_rx) = mpsc::sync_channel(1);
+    let (address, server) = mock(move |mut socket| {
+        hello(&mut socket);
+        assert_eq!(
+            read(&mut socket),
+            json!({"id":2,"op":"subscribe","keys":["integer","float","enabled","fault"]})
+        );
+        send(
+            &mut socket,
+            json!({"id":2,"status":"ok","keys":["integer","float","enabled","fault"]}),
+        );
+        // Partial and coalesced frames carry all three scalar types.
+        let frames = [
+            ("integer", json!(9_007_199_254_740_993i64)),
+            ("float", json!(20.0)),
+            ("enabled", json!(true)),
+            ("fault", json!(false)),
+            ("unsubscribed", json!(true)),
+        ]
+        .into_iter()
+        .map(|(key, value)| format!("{}\n", observation(key, value, 1234)))
+        .collect::<String>();
+        socket
+            .get_mut()
+            .write_all(&frames.as_bytes()[..19])
+            .unwrap();
+        socket
+            .get_mut()
+            .write_all(&frames.as_bytes()[19..])
+            .unwrap();
+        for (index, (key, value)) in [
+            ("enabled", json!(true)),
+            ("enabled", json!(false)),
+            ("enabled", json!(true)),
+            ("enabled", json!(false)),
+            ("power", json!(20)),
+            ("reference", json!(20.0)),
+            ("exact", json!(9_007_199_254_740_993i64)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = read(&mut socket);
+            assert_eq!(
+                request,
+                json!({"id":index+3,"op":"set","key":key,"value":value})
+            );
+            assert_eq!(request["value"].to_string(), value.to_string());
+        }
+        assert_eq!(
+            read(&mut socket),
+            json!({"id":10,"op":"get","key":"enabled"})
+        );
+        seen_tx.send(()).unwrap();
+        // No response is released until all Steel calls have returned their IDs.
+        gate_rx.recv_timeout(WAIT).unwrap();
+        send(
+            &mut socket,
+            json!({"id":10,"status":"ok","key":"enabled","value":false,"unit":"","completed_at_unix_ms":5678}),
+        );
+        for id in (4..=9).rev() {
+            send(&mut socket, json!({"id":id,"status":"ok"}));
+        }
+        send(
+            &mut socket,
+            json!({"id":3,"status":"error","error":"outcome_unknown"}),
+        );
+        until_closed(&mut socket); // Any retry, including Boolean set, fails the test.
+    });
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let steel = SteelThread::new(connection.sender());
+    steel
+        .eval(&format!("(lab/connect! \"{address}\")"))
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Ready
+    });
+    steel.eval(r#"(plot/add! "Integer" "") (plot/bind! "Integer" "integer") (plot/add! "Float" "") (plot/bind! "Float" "float") (plot/add! "Wrong" "") (plot/point! "Wrong" 0.0 42.0) (plot/bind! "Wrong" "enabled")"#).unwrap();
+    assert_eq!(
+        steel
+            .eval(r#"(lab/subscribe! '("integer" "float" "enabled" "fault"))"#)
+            .unwrap(),
+        vec!["2"]
+    );
+    pump(&mut connection, &mut plots, |c, p| {
+        c.boolean_signals.len() == 2 && p.series["Float"].points.len() == 1
+    });
+    assert_eq!(connection.phase(), Phase::Ready);
+    assert_eq!(
+        connection.boolean_signals["enabled"],
+        BooleanState {
+            value: true,
+            completed_at_unix_ms: 1234
+        }
+    );
+    assert!(!connection.boolean_signals["fault"].value);
+    assert!(!connection.boolean_signals.contains_key("unsubscribed"));
+    steel
+        .eval(r#"(plot/add! "Late binding" "") (plot/bind! "Late binding" "enabled")"#)
+        .unwrap();
+    connection.update(&mut plots);
+    assert!(
+        plots.series["Late binding"]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Boolean")
+    );
+    assert!(plots.series["Late binding"].points.is_empty());
+    assert_eq!(
+        plots.series["Integer"].points[0]
+            .measurement
+            .as_ref()
+            .unwrap()
+            .reading,
+        Reading::Value {
+            value: ScalarValue::Integer(9_007_199_254_740_993),
+            unit: String::new()
+        }
+    );
+    assert_eq!(plots.series["Float"].points[0].xy, [1.234, 20.0]);
+    assert_eq!(plots.series["Wrong"].points.len(), 1);
+    assert_eq!(plots.series["Wrong"].points[0].xy, [0.0, 42.0]);
+    assert!(
+        plots.series["Wrong"]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Boolean")
+    );
+    for expression in [
+        r#"(lab/set! "enabled" "true")"#,
+        r#"(lab/set! "enabled" '(#t))"#,
+        r#"(lab/set! "power" 9223372036854775808)"#,
+    ] {
+        assert!(steel.eval(expression).is_err());
+    }
+    steel.eval(r#"(define enabled "enabled")"#).unwrap();
+    assert_eq!(steel.eval(r#"(lab/set! "enabled" #t) (lab/set! "enabled" #f) (lab/set! enabled #t) (lab/set! enabled #f) (lab/set! "power" 20) (lab/set! "reference" 20.0) (lab/set! "exact" 9007199254740993) (lab/get enabled)"#).unwrap(), vec!["3","4","5","6","7","8","9","10"]);
+    assert_eq!(steel.eval("(+ 1 2)").unwrap(), vec!["3"]);
+    seen_rx.recv_timeout(WAIT).unwrap();
+    assert!(!has_result(&connection, 3));
+    gate_tx.send(()).unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        (3..=10).all(|id| has_result(c, id))
+    });
+    assert!(connection.boolean_signals["enabled"].value); // get is a journal result, not a stream update.
+    assert_eq!(
+        connection.boolean_signals["enabled"].completed_at_unix_ms,
+        1234
+    );
+    let get = connection
+        .journal
+        .iter()
+        .find(|e| e.request_id() == Some(10))
+        .unwrap();
+    assert!(get.text().contains("Boolean(false)"));
+    assert!(get.text().contains("5678"));
+    let results: Vec<_> = connection
+        .journal
+        .iter()
+        .filter(|e| e.request_id() == Some(3))
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].text().contains("outcome_unknown"));
+    assert_eq!(connection.phase(), Phase::Ready);
+    close(&mut connection, &mut plots);
+    assert!(connection.boolean_signals.is_empty());
+    server.join().unwrap();
+    steel.stop();
+}
+
+#[test]
+fn boolean_read_error_recovery_and_unsubscribe_update_current_states_after_ack() {
+    let (gate_tx, gate_rx) = mpsc::sync_channel(1);
+    let (address, server) = mock(move |mut socket| {
+        hello(&mut socket);
+        assert_eq!(read(&mut socket)["id"], 2);
+        send(
+            &mut socket,
+            json!({"id":2,"status":"ok","keys":["enabled","fault"]}),
+        );
+        send(&mut socket, observation("enabled", json!(true), 1000));
+        send(&mut socket, observation("fault", json!(false), 1000));
+        assert_eq!(read(&mut socket), json!({"id":3,"op":"ping"}));
+        send(
+            &mut socket,
+            json!({"event":"measurement","status":"error","key":"enabled","error":"Boolean read failed","completed_at_unix_ms":2000}),
+        );
+        send(&mut socket, json!({"id":3,"status":"ok"}));
+        assert_eq!(read(&mut socket), json!({"id":4,"op":"ping"}));
+        send(&mut socket, observation("enabled", json!(false), 3000));
+        send(&mut socket, json!({"id":4,"status":"ok"}));
+        assert_eq!(
+            read(&mut socket),
+            json!({"id":5,"op":"unsubscribe","keys":["enabled"]})
+        );
+        send(&mut socket, observation("enabled", json!(true), 4000));
+        gate_rx.recv_timeout(WAIT).unwrap();
+        send(&mut socket, json!({"id":5,"status":"ok","keys":["fault"]}));
+        send(&mut socket, observation("enabled", json!(false), 5000)); // ignored after ACK
+        assert_eq!(
+            read(&mut socket),
+            json!({"id":6,"op":"unsubscribe","keys":["fault"]})
+        );
+        send(
+            &mut socket,
+            json!({"id":6,"status":"error","error":"runtime_timeout"}),
+        );
+        until_closed(&mut socket);
+    });
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let sender = connection.sender();
+    sender.connect(address).unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Ready
+    });
+    sender
+        .request(Request::Subscribe {
+            keys: vec!["enabled".into(), "fault".into()],
+        })
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.boolean_signals.len() == 2
+    });
+    sender.request(Request::Ping).unwrap();
+    pump(&mut connection, &mut plots, |c, _| has_result(c, 3));
+    assert!(!connection.boolean_signals.contains_key("enabled"));
+    assert!(connection.boolean_signals.contains_key("fault"));
+    assert_eq!(connection.signal_errors["enabled"], "Boolean read failed");
+    sender.request(Request::Ping).unwrap();
+    pump(&mut connection, &mut plots, |c, _| has_result(c, 4));
+    assert_eq!(
+        connection.boolean_signals["enabled"],
+        BooleanState {
+            value: false,
+            completed_at_unix_ms: 3000
+        }
+    );
+    assert!(!connection.signal_errors.contains_key("enabled"));
+    sender
+        .request(Request::Unsubscribe {
+            keys: vec!["enabled".into()],
+        })
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.boolean_signals["enabled"].completed_at_unix_ms == 4000
+    });
+    assert!(connection.subscriptions.contains("enabled"));
+    gate_tx.send(()).unwrap();
+    pump(&mut connection, &mut plots, |c, _| has_result(c, 5));
+    assert!(!connection.boolean_signals.contains_key("enabled"));
+    sender
+        .request(Request::Unsubscribe {
+            keys: vec!["fault".into()],
+        })
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| has_result(c, 6));
+    assert_eq!(connection.boolean_signals.len(), 1);
+    assert!(connection.boolean_signals.contains_key("fault"));
+    assert!(connection.subscriptions.contains("fault")); // failed unsubscribe retains state
+    close(&mut connection, &mut plots);
+    assert!(connection.boolean_signals.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn boolean_disconnect_reconnect_requires_fresh_subscription_and_measurement() {
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let sender = connection.sender();
+    for number in 1..=2 {
+        let (address, server) = mock(move |mut socket| {
+            hello(&mut socket);
+            assert_eq!(read(&mut socket), json!({"id":2,"op":"ping"}));
+            send(&mut socket, json!({"id":2,"status":"ok"}));
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":3,"op":"subscribe","keys":["enabled"]})
+            );
+            send(
+                &mut socket,
+                json!({"id":3,"status":"ok","keys":["enabled"]}),
+            );
+            send(
+                &mut socket,
+                observation("enabled", json!(number == 1), number * 1000),
+            );
+            until_closed(&mut socket);
+        });
+        sender.connect(address).unwrap();
+        pump(&mut connection, &mut plots, |c, _| {
+            c.phase() == Phase::Ready
+        });
+        assert!(connection.boolean_signals.is_empty());
+        assert!(connection.subscriptions.is_empty());
+        assert_eq!(connection.connection, number);
+        sender.request(Request::Ping).unwrap();
+        sender
+            .request(Request::Subscribe {
+                keys: vec!["enabled".into()],
+            })
+            .unwrap();
+        pump(&mut connection, &mut plots, |c, _| {
+            c.boolean_signals.len() == 1
+        });
+        assert_eq!(
+            connection.boolean_signals["enabled"],
+            BooleanState {
+                value: number == 1,
+                completed_at_unix_ms: number * 1000
+            }
+        );
+        sender.disconnect().unwrap();
+        connection.update(&mut plots);
+        assert!(connection.boolean_signals.is_empty());
+        pump(&mut connection, &mut plots, |c, _| {
+            c.phase() == Phase::Stopped
+        });
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn boolean_stream_loss_clears_state_and_preserves_pending_set_uncertainty() {
+    for error in [
+        Some("observation_data_lost"),
+        Some("observation_stream_closed"),
+        None,
+    ] {
+        let (address, server) = mock(move |mut socket| {
+            hello(&mut socket);
+            read(&mut socket);
+            send(
+                &mut socket,
+                json!({"id":2,"status":"ok","keys":["enabled"]}),
+            );
+            send(&mut socket, observation("enabled", json!(true), 1000));
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":3,"op":"set","key":"enabled","value":false})
+            );
+            if let Some(error) = error {
+                send(&mut socket, json!({"status":"error","error":error}));
+                until_closed(&mut socket);
+            }
+        });
+        let mut connection = Integration::default();
+        let mut plots = PlotState::default();
+        let sender = connection.sender();
+        sender.connect(address).unwrap();
+        pump(&mut connection, &mut plots, |c, _| {
+            c.phase() == Phase::Ready
+        });
+        sender
+            .request(Request::Subscribe {
+                keys: vec!["enabled".into()],
+            })
+            .unwrap();
+        pump(&mut connection, &mut plots, |c, _| {
+            c.boolean_signals.len() == 1
+        });
+        sender
+            .request(Request::Set {
+                key: "enabled".into(),
+                value: ScalarValue::Boolean(false),
+            })
+            .unwrap();
+        pump(&mut connection, &mut plots, |c, _| {
+            c.phase() == Phase::Stopped
+        });
+        assert!(connection.boolean_signals.is_empty());
+        assert!(connection.stream_error.is_some());
+        let results: Vec<_> = connection
+            .journal
+            .iter()
+            .filter(|e| e.request_id() == Some(3))
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0].result,
+            JournalResult::RequestFailed {
+                failure: RequestFailure::OutcomeUnknown,
+                ..
+            }
+        ));
+        if let Some(error) = error {
+            assert!(connection.journal.iter().any(|e| e.text().contains(error)));
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn boolean_queue_overflow_clears_current_state_before_draining_backlog() {
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (address, server) = mock(move |mut socket| {
+        hello(&mut socket);
+        read(&mut socket);
+        send(
+            &mut socket,
+            json!({"id":2,"status":"ok","keys":["enabled"]}),
+        );
+        send(&mut socket, observation("enabled", json!(true), 1000));
+        release_rx.recv_timeout(WAIT).unwrap();
+        let frames = (0..20)
+            .map(|time| format!("{}\n", observation("enabled", json!(false), time + 2000)))
+            .collect::<String>();
+        socket.get_mut().write_all(frames.as_bytes()).unwrap();
+        until_closed(&mut socket);
+    });
+    let mut connection = Integration::new(ClientOptions {
+        event_capacity: 2,
+        ..Default::default()
+    });
+    let mut plots = PlotState::default();
+    let sender = connection.sender();
+    sender.connect(address).unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Ready
+    });
+    sender
+        .request(Request::Subscribe {
+            keys: vec!["enabled".into()],
+        })
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.boolean_signals.len() == 1
+    });
+    release_tx.send(()).unwrap();
+    server.join().unwrap(); // overflow occurred without GUI polling
+    connection.update(&mut plots);
+    assert!(connection.boolean_signals.is_empty());
+    assert!(
+        connection
+            .stream_error
+            .as_ref()
+            .unwrap()
+            .contains("EventQueueOverflow")
+    );
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Stopped
+    });
+}
+
+#[test]
+fn boolean_numeric_curve_rejection_keeps_history_and_breaks_the_next_segment() {
+    let mut plots = PlotState::default();
+    add(&mut plots, "A", "signal");
+    plots.measurement(sample("signal", ScalarValue::Integer(20), "degC", 1000));
+    let errors = plots.measurement(sample("signal", ScalarValue::Boolean(true), "", 2000));
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Boolean")); // type error takes precedence over unit mismatch
+    assert_eq!(plots.series["A"].points.len(), 1);
+    assert!(
+        plots
+            .measurement(sample("signal", ScalarValue::Boolean(false), "", 3000))
+            .is_empty()
+    );
+    plots.measurement(sample("signal", ScalarValue::Float(21.0), "degC", 4000));
+    assert_eq!(plots.series["A"].segments(), vec![0..1, 1..2]);
+    assert!(plots.series["A"].error.is_none());
 }
