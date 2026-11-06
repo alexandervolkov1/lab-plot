@@ -1,7 +1,32 @@
+//! Standalone protocol-v1 TCP client; no GUI or Steel integration.
+//!
+//! Start with [`Client::start`], poll [`Client::try_recv`] for [`ClientEvent::Ready`],
+//! then clone [`Client::sender`] for producers. [`ClientSender::request`] returns
+//! the admitted request ID or an explicit rejection (nothing sent). Replies are
+//! matched by ID, while measurements arrive independently on the same socket.
+//!
+//! Defaults: 64 outgoing commands, 64 pending requests, 1024 incoming events,
+//! 16 KiB outgoing / 64 KiB incoming frames. An event overflow closes the socket;
+//! [`Client::state`] exposes the failure even when the event queue is full.
+//! A termination-only reserve of at most 130 events preserves final request
+//! results. Keep draining `try_recv` through `ClientEvent::Stopped`.
+//!
+//! A `set` rejected locally or reported as [`RequestFailure::NotSent`] cannot
+//! execute. A sent `set` without a reliable reply yields `OutcomeUnknown`.
+//! Server errors remain explicit in [`ResponseData::Error`]: `runtime_timeout`
+//! means execution never started; `outcome_unknown` means it may have started.
+//! No request is retried. EOF never proves stream completeness.
+//!
+//! Connection/hello timeouts default to 3 seconds; pending requests to 15 seconds.
+//! A local timeout closes the connection and preserves uncertainty for sent sets.
+//! [`Client::request_shutdown`] only signals; [`Client::shutdown`] and Drop join
+//! the worker (potentially waiting for the bounded connection attempt).
 use serde_json::{Value, json};
 
 mod protocol;
+mod worker;
 pub use protocol::*;
+pub use worker::*;
 
 pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024;
 
