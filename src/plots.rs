@@ -1,5 +1,5 @@
 //! Numeric plot history. TCP observations stay in Rust, including their metadata.
-use crate::tcp_client::{Measurement, Number, Reading};
+use crate::tcp_client::{Measurement, Reading, ScalarValue};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -34,6 +34,14 @@ pub struct PlotSeries {
     next_break: bool,
 }
 impl PlotSeries {
+    fn reject_boolean(&mut self, name: &str, key: &str) -> Option<String> {
+        let error = format!("{name}: Boolean signal {key} cannot be displayed on a numeric curve");
+        let changed = self.error.as_ref() != Some(&error);
+        self.error = Some(error.clone());
+        self.next_break = true;
+        changed.then_some(error)
+    }
+
     fn new(unit: String, color_index: usize) -> Self {
         Self {
             unit,
@@ -158,7 +166,13 @@ impl PlotState {
             series.next_break = true;
         }
     }
-    /// Returns unit mismatch messages; instrument errors are retained per curve.
+    /// Also reject a newly added binding when the latest observation is already Boolean.
+    pub(crate) fn reject_boolean_binding(&mut self, name: &str) -> Option<String> {
+        let series = self.series.get_mut(name)?;
+        let key = series.key.clone()?;
+        series.reject_boolean(name, &key)
+    }
+    /// Returns type/unit mismatch messages; instrument errors are retained per curve.
     pub fn measurement(&mut self, measurement: Measurement) -> Vec<String> {
         let observation = Arc::new(measurement);
         let mut errors = Vec::new();
@@ -171,22 +185,29 @@ impl PlotState {
                     series.error = Some(error.clone());
                     series.next_break = true;
                 }
-                Reading::Value { unit, .. } if unit != &series.unit => {
-                    let error = format!(
-                        "{name}: unit mismatch for {}: expected {:?}, received {:?}",
-                        observation.key, series.unit, unit
-                    );
-                    if series.error.as_ref() != Some(&error) {
-                        errors.push(error.clone());
-                    }
-                    series.error = Some(error);
-                    series.next_break = true;
-                }
-                Reading::Value { value, .. } => {
+                Reading::Value { value, unit } => {
                     let value = match value {
-                        Number::Integer(v) => *v as f64,
-                        Number::Float(v) => *v,
+                        ScalarValue::Integer(v) => *v as f64,
+                        ScalarValue::Float(v) => *v,
+                        ScalarValue::Boolean(_) => {
+                            if let Some(error) = series.reject_boolean(name, &observation.key) {
+                                errors.push(error);
+                            }
+                            continue;
+                        }
                     };
+                    if unit != &series.unit {
+                        let error = format!(
+                            "{name}: unit mismatch for {}: expected {:?}, received {:?}",
+                            observation.key, series.unit, unit
+                        );
+                        if series.error.as_ref() != Some(&error) {
+                            errors.push(error.clone());
+                        }
+                        series.error = Some(error);
+                        series.next_break = true;
+                        continue;
+                    }
                     series.push(
                         [observation.completed_at_unix_ms as f64 / 1000.0, value],
                         Some(observation.clone()),

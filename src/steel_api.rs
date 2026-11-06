@@ -15,7 +15,7 @@
 //! Network commands return positive request IDs, scoped to the connection.
 //! The GUI retains the last 200 results/errors and counts evicted entries.
 //! `outcome_unknown`/`OutcomeUnknown` must never be interpreted as non-execution.
-//! `(lab/set! "enabled" #t)` recognizes Boolean but rejects it in protocol v1.
+//! `(lab/set! "enabled" #t)` / `#f` send Boolean without numeric conversion.
 //!
 //! `(plot/unbind! "Heater")` keeps history; `(plot/remove! "Heater")` removes
 //! the curve. Neither changes subscriptions. Use
@@ -30,7 +30,7 @@
 use crate::{
     integration::ControlSender,
     plots::PlotCommand,
-    tcp_client::{Number, Request},
+    tcp_client::{Request, ScalarValue},
 };
 use steel::{
     SteelVal,
@@ -50,22 +50,21 @@ fn text_limit(value: &str) -> Result<(), String> {
         Ok(())
     }
 }
-/// Keeps the universal set signature ready for future protocol value types.
-/// Boolean is recognized explicitly, never coerced to a numeric value.
-pub fn set_number(value: &SteelVal) -> Result<Number, String> {
+/// Preserve Integer, Float and Boolean without implicit conversions.
+pub fn set_value(value: &SteelVal) -> Result<ScalarValue, String> {
     match value {
-        SteelVal::IntV(value) => Ok(Number::Integer(*value as i64)),
+        SteelVal::IntV(value) => Ok(ScalarValue::Integer(*value as i64)),
         SteelVal::BigNum(value) => value
             .to_string()
             .parse::<i64>()
-            .map(Number::Integer)
+            .map(ScalarValue::Integer)
             .map_err(|_| "Integer outside i64 range".into()),
-        SteelVal::NumV(value) if value.is_finite() => Ok(Number::Float(*value)),
-        SteelVal::BoolV(_) => Err(
-            "Boolean is recognized but is not supported by lab-server protocol v1; nothing sent"
+        SteelVal::NumV(value) if value.is_finite() => Ok(ScalarValue::Float(*value)),
+        SteelVal::BoolV(value) => Ok(ScalarValue::Boolean(*value)),
+        _ => Err(
+            "Expected an i64 Integer, finite Float or Boolean; this value type is unsupported"
                 .into(),
         ),
-        _ => Err("Expected an i64 Integer or finite Float; this value type is unsupported".into()),
     }
 }
 
@@ -168,7 +167,7 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
             sender
                 .request(Request::Set {
                     key,
-                    value: set_number(&value)?,
+                    value: set_value(&value)?,
                 })
                 .map(request_id)
         },

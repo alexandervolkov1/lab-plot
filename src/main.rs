@@ -154,6 +154,11 @@ fn connection_status(ui: &mut egui::Ui, connection: &Integration, plots: &PlotSt
     }
     egui::CollapsingHeader::new("TCP results and subscriptions").default_open(true).show(ui, |ui| {
         ui.label(format!("Subscriptions: {}", connection.subscriptions.iter().cloned().collect::<Vec<_>>().join(", ")));
+        ui.label("Boolean signals");
+        if connection.boolean_signals.is_empty() { ui.weak("No current Boolean observations"); }
+        for (key, state) in &connection.boolean_signals {
+            ui.label(format!("{key}    {}    ({} Unix ms)", state.value, state.completed_at_unix_ms));
+        }
         for (key, error) in &connection.signal_errors { ui.colored_label(ui.visuals().error_fg_color, format!("{key}: {error}")); }
         for (name, series) in &plots.series {
             if let Some(error) = &series.error { ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}")); }
@@ -299,8 +304,62 @@ mod tests {
     }
 
     #[test]
+    fn boolean_status_panel_displays_values_timestamps_and_read_errors() {
+        let ctx = egui::Context::default();
+        let mut connection = Integration::default();
+        let plots = PlotState::default();
+        for (key, value) in [("enabled", true), ("fault", false)] {
+            connection.boolean_signals.insert(
+                key.into(),
+                lab_plot::integration::BooleanState {
+                    value,
+                    completed_at_unix_ms: 1234,
+                },
+            );
+        }
+        fn painted_text(shape: &egui::epaint::Shape, text: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => text.push_str(&t.galley.job.text),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        painted_text(shape, text);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let draw = |connection: &Integration| {
+            let mut text = String::new();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                connection_status(ui, connection, &plots)
+            });
+            for shape in &output.shapes {
+                painted_text(&shape.shape, &mut text);
+            }
+            output.drop_without_applying_deltas();
+            text
+        };
+        draw(&connection); // initial layout
+        let text = draw(&connection);
+        assert!(text.contains("Boolean signals"));
+        assert!(text.contains("enabled    true    (1234 Unix ms)"));
+        assert!(text.contains("fault    false    (1234 Unix ms)"));
+        connection.boolean_signals.remove("enabled");
+        connection
+            .signal_errors
+            .insert("enabled".into(), "read failed".into());
+        let text = draw(&connection);
+        assert!(!text.contains("enabled    true"));
+        assert!(text.contains("enabled: read failed"));
+        connection.begin_close();
+        let text = draw(&connection);
+        assert!(text.contains("No current Boolean observations"));
+        assert!(!text.contains("fault    false"));
+    }
+
+    #[test]
     fn headless_gui_draws_discontinuous_curves_and_handles_close() {
-        use lab_plot::tcp_client::{Measurement, Number, Reading};
+        use lab_plot::tcp_client::{Measurement, Reading, ScalarValue};
         let ctx = egui::Context::default();
         let mut app = LabPlot::new();
         app.plots
@@ -323,7 +382,7 @@ mod tests {
                     Reading::Error("read failed".into())
                 } else {
                     Reading::Value {
-                        value: Number::Float(20.0),
+                        value: ScalarValue::Float(20.0),
                         unit: "degC".into(),
                     }
                 },

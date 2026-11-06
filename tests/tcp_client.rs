@@ -125,7 +125,7 @@ fn concurrent_ids_multiple_pending_reverse_responses_and_measurements() {
             event(&client),
             ClientEvent::Measurement(Measurement {
                 reading: Reading::Value {
-                    value: Number::Float(25.0),
+                    value: ScalarValue::Float(25.0),
                     ..
                 },
                 ..
@@ -278,8 +278,8 @@ fn all_request_fields_and_get_results() {
         }
     }
     for (value, error) in [
-        (Number::Integer(20), "outcome_unknown"),
-        (Number::Float(20.0), "runtime_timeout"),
+        (ScalarValue::Integer(20), "outcome_unknown"),
+        (ScalarValue::Float(20.0), "runtime_timeout"),
     ] {
         let id = client
             .sender()
@@ -390,7 +390,7 @@ fn eof_with_pending_set_is_unknown_even_with_partial_response() {
             .sender()
             .request(Request::Set {
                 key: "p".into(),
-                value: Number::Integer(1),
+                value: ScalarValue::Integer(1),
             })
             .unwrap();
         let (events, reason) = stopped(&client);
@@ -479,7 +479,7 @@ fn event_overflow_is_fatal_and_retains_definitive_response() {
             .sender()
             .request(Request::Set {
                 key: "p".into(),
-                value: Number::Integer(1),
+                value: ScalarValue::Integer(1),
             })
             .unwrap();
         wait_state(&client, |s| matches!(s, ClientState::Stopped(_)));
@@ -537,7 +537,7 @@ fn bounded_pending_outgoing_and_shutdown_classify_unsent_set() {
         .sender()
         .request(Request::Set {
             key: "p".into(),
-            value: Number::Integer(1),
+            value: ScalarValue::Integer(1),
         })
         .unwrap();
     assert_eq!(
@@ -619,7 +619,7 @@ fn request_timeout_does_not_claim_set_was_cancelled() {
         .sender()
         .request(Request::Set {
             key: "p".into(),
-            value: Number::Integer(1),
+            value: ScalarValue::Integer(1),
         })
         .unwrap();
     assert_eq!(
@@ -681,7 +681,7 @@ fn full_pending_and_outgoing_queues_each_get_one_final_result_on_overflow() {
         assert_eq!(
             client.sender().request(Request::Set {
                 key: "p".into(),
-                value: Number::Integer(id as i64)
+                value: ScalarValue::Integer(id as i64)
             }),
             Ok(id)
         );
@@ -691,7 +691,7 @@ fn full_pending_and_outgoing_queues_each_get_one_final_result_on_overflow() {
         assert_eq!(
             client.sender().request(Request::Set {
                 key: "p".into(),
-                value: Number::Integer(id as i64)
+                value: ScalarValue::Integer(id as i64)
             }),
             Ok(id)
         );
@@ -746,7 +746,7 @@ fn idless_error_does_not_consume_pending_and_mismatched_reply_is_rejected() {
             .sender()
             .request(Request::Set {
                 key: "p".into(),
-                value: Number::Integer(1),
+                value: ScalarValue::Integer(1),
             })
             .unwrap();
         assert_eq!(

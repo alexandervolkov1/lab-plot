@@ -138,6 +138,12 @@ impl JournalEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BooleanState {
+    pub value: bool,
+    pub completed_at_unix_ms: u64,
+}
+
 pub struct Integration {
     shared: Arc<Mutex<Bridge>>,
     client: Option<Client>,
@@ -148,6 +154,9 @@ pub struct Integration {
     pub stream_error: Option<String>,
     pub subscriptions: BTreeSet<String>,
     pub signal_errors: BTreeMap<String, String>,
+    /// Latest successful Boolean observations, bounded by acknowledged subscriptions.
+    /// Cleared on read errors, unsubscribe and any interruption of the stream.
+    pub boolean_signals: BTreeMap<String, BooleanState>,
     pub journal: VecDeque<JournalEntry>,
     pub evicted: u64,
 }
@@ -173,6 +182,7 @@ impl Integration {
             stream_error: None,
             subscriptions: BTreeSet::new(),
             signal_errors: BTreeMap::new(),
+            boolean_signals: BTreeMap::new(),
             journal: VecDeque::new(),
             evicted: 0,
         }
@@ -198,6 +208,7 @@ impl Integration {
     /// Prevent new commands, then let GUI updates drain final results and reap
     /// the worker. Called only after the existing unsaved-script close decision.
     pub fn begin_close(&mut self) {
+        self.boolean_signals.clear();
         let mut bridge = lock(&self.shared);
         bridge.closing = true;
         bridge.commands.clear();
@@ -223,7 +234,19 @@ impl Integration {
         while let Some(command) = bridge.commands.pop_front() {
             match command {
                 Control::Plot(command) => {
+                    let known_boolean = match &command {
+                        PlotCommand::Bind { name, key }
+                            if self.boolean_signals.contains_key(key) =>
+                        {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    };
                     if let Err(error) = plots.apply(command) {
+                        self.record(JournalResult::Message(error));
+                    } else if let Some(name) = known_boolean
+                        && let Some(error) = plots.reject_boolean_binding(&name)
+                    {
                         self.record(JournalResult::Message(error));
                     }
                 }
@@ -233,6 +256,7 @@ impl Integration {
                     self.stream_error = None;
                     self.subscriptions.clear();
                     self.signal_errors.clear();
+                    self.boolean_signals.clear();
                     self.terminal_received = false;
                     plots.break_bound();
                     match Client::start(address, self.options.clone()) {
@@ -271,6 +295,9 @@ impl Integration {
         } else if bridge.phase == Phase::Stopping {
             plots.break_bound();
         }
+        if bridge.phase != Phase::Ready || self.stream_error.is_some() {
+            self.boolean_signals.clear();
+        }
         let mut count = 0;
         while count < EVENTS_PER_FRAME {
             let Some(event) = self.client.as_ref().and_then(Client::try_recv) else {
@@ -294,6 +321,7 @@ impl Integration {
                     }
                     match &measurement.reading {
                         Reading::Error(error) => {
+                            self.boolean_signals.remove(&measurement.key);
                             self.signal_errors
                                 .insert(measurement.key.clone(), error.clone());
                             self.record(JournalResult::Message(format!(
@@ -301,8 +329,19 @@ impl Integration {
                                 measurement.key, measurement.completed_at_unix_ms
                             )));
                         }
-                        Reading::Value { .. } => {
+                        Reading::Value { value, .. } => {
                             self.signal_errors.remove(&measurement.key);
+                            if let ScalarValue::Boolean(value) = value {
+                                self.boolean_signals.insert(
+                                    measurement.key.clone(),
+                                    BooleanState {
+                                        value: *value,
+                                        completed_at_unix_ms: measurement.completed_at_unix_ms,
+                                    },
+                                );
+                            } else {
+                                self.boolean_signals.remove(&measurement.key);
+                            }
                         }
                     }
                     for error in plots.measurement(measurement) {
@@ -315,6 +354,7 @@ impl Integration {
                         for removed in self.subscriptions.difference(&next) {
                             plots.break_key(removed);
                             self.signal_errors.remove(removed);
+                            self.boolean_signals.remove(removed);
                         }
                         self.subscriptions = next;
                     }
@@ -329,6 +369,7 @@ impl Integration {
                         "observation_data_lost" | "observation_stream_closed"
                     ) {
                         self.stream_error = Some(error.error.clone());
+                        self.boolean_signals.clear();
                         plots.break_bound();
                     }
                     self.record(JournalResult::ServerError(error));
@@ -338,6 +379,7 @@ impl Integration {
                     self.record(JournalResult::Message(format!("Stopped: {reason:?}")));
                     self.terminal_received = true;
                     self.subscriptions.clear();
+                    self.boolean_signals.clear();
                     plots.break_bound();
                 }
             }

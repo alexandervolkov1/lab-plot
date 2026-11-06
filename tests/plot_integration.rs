@@ -10,7 +10,7 @@ use steel::steel_vm::engine::Engine;
 mod support;
 use support::*;
 
-fn sample(key: &str, value: Number, unit: &str, time: u64) -> Measurement {
+fn sample(key: &str, value: ScalarValue, unit: &str, time: u64) -> Measurement {
     Measurement {
         key: key.into(),
         completed_at_unix_ms: time,
@@ -106,7 +106,7 @@ fn numeric_routing_metadata_shared_observations_and_discontinuities() {
     add(&mut plots, "Sample", "sample");
     let exact = sample(
         "opaque/device/heater",
-        Number::Integer(9_007_199_254_740_993),
+        ScalarValue::Integer(9_007_199_254_740_993),
         "degC",
         1_700_000_000_123,
     );
@@ -132,7 +132,7 @@ fn numeric_routing_metadata_shared_observations_and_discontinuities() {
     );
     plots.measurement(sample(
         &exact.key,
-        Number::Float(2.5),
+        ScalarValue::Float(2.5),
         "degC",
         1_700_000_002_000,
     ));
@@ -146,7 +146,7 @@ fn numeric_routing_metadata_shared_observations_and_discontinuities() {
         .unwrap();
     plots.measurement(sample(
         "sample",
-        Number::Float(3.0),
+        ScalarValue::Float(3.0),
         "degC",
         1_700_000_003_000,
     ));
@@ -159,7 +159,7 @@ fn numeric_routing_metadata_shared_observations_and_discontinuities() {
         .unwrap();
     plots.measurement(sample(
         "sample",
-        Number::Float(4.0),
+        ScalarValue::Float(4.0),
         "degC",
         1_700_000_004_000,
     ));
@@ -176,8 +176,8 @@ fn numeric_routing_metadata_shared_observations_and_discontinuities() {
 fn unit_mismatch_skips_points_and_keeps_historical_units() {
     let mut plots = PlotState::default();
     add(&mut plots, "A", "a");
-    plots.measurement(sample("a", Number::Float(1.0), "degC", 1000));
-    let errors = plots.measurement(sample("a", Number::Float(273.0), "K", 2000));
+    plots.measurement(sample("a", ScalarValue::Float(1.0), "degC", 1000));
+    let errors = plots.measurement(sample("a", ScalarValue::Float(273.0), "K", 2000));
     assert_eq!(errors.len(), 1);
     assert!(
         plots.series["A"]
@@ -193,7 +193,7 @@ fn unit_mismatch_skips_points_and_keeps_historical_units() {
             unit: "K".into(),
         })
         .unwrap();
-    plots.measurement(sample("a", Number::Float(274.0), "K", 3000));
+    plots.measurement(sample("a", ScalarValue::Float(274.0), "K", 3000));
     assert_eq!(plots.series["A"].segments(), vec![0..1, 1..2]);
     assert_eq!(plots.series["A"].sample_unit(0), "degC");
     assert_eq!(plots.series["A"].sample_unit(1), "K");
@@ -205,7 +205,12 @@ fn measurement_history_is_bounded_and_manual_commands_keep_behavior() {
     let mut plots = PlotState::default();
     add(&mut plots, "A", "a");
     for i in 0..MAX_POINTS + 3 {
-        plots.measurement(sample("a", Number::Integer(i as i64), "degC", i as u64));
+        plots.measurement(sample(
+            "a",
+            ScalarValue::Integer(i as i64),
+            "degC",
+            i as u64,
+        ));
     }
     assert_eq!(plots.series["A"].points.len(), MAX_POINTS);
     assert_eq!(
@@ -377,14 +382,6 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
     });
     assert_eq!(plots.series["Copy"].points.len(), 1);
     assert_eq!(plots.series["A"].points[0].xy, [1.234, 12.5]);
-    for value in ["#t", "#f"] {
-        assert!(
-            steel
-                .eval(&format!("(lab/set! \"enabled\" {value})"))
-                .unwrap_err()
-                .contains("Boolean")
-        );
-    }
     assert!(
         steel
             .eval("(lab/set! \"power\" 9223372036854775808)")
@@ -570,7 +567,7 @@ fn read_errors_failed_subscription_and_runtime_timeout_remain_visible() {
     sender
         .request(Request::Set {
             key: "power".into(),
-            value: Number::Integer(20),
+            value: ScalarValue::Integer(20),
         })
         .unwrap();
     pump(&mut connection, &mut plots, |c, _| {
@@ -643,7 +640,7 @@ fn stream_failures_stop_points_and_finalize_set_without_retry() {
         sender
             .request(Request::Set {
                 key: "power".into(),
-                value: Number::Integer(20),
+                value: ScalarValue::Integer(20),
             })
             .unwrap();
         pump(&mut connection, &mut plots, |c, _| {

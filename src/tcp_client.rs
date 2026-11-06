@@ -30,10 +30,19 @@ pub use worker::*;
 
 pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024;
 
+/// Numeric parameter bounds. Boolean parameters have no numeric bounds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Number {
     Integer(i64),
     Float(f64),
+}
+
+/// A protocol value. Boolean is never coerced to a number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarValue {
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +50,7 @@ pub enum Request {
     Ping,
     Describe,
     Get { key: String },
-    Set { key: String, value: Number },
+    Set { key: String, value: ScalarValue },
     Subscribe { keys: Vec<String> },
     Unsubscribe { keys: Vec<String> },
 }
@@ -92,9 +101,10 @@ pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError>
 
         Request::Set { key, value } => {
             let value = match value {
-                Number::Integer(value) => Value::from(*value),
+                ScalarValue::Boolean(value) => Value::Bool(*value),
+                ScalarValue::Integer(value) => Value::from(*value),
 
-                Number::Float(value) => {
+                ScalarValue::Float(value) => {
                     let number =
                         serde_json::Number::from_f64(*value).ok_or(EncodeError::NonFiniteFloat)?;
 
@@ -180,7 +190,7 @@ mod tests {
             1,
             &Request::Set {
                 key: "power".into(),
-                value: Number::Integer(20),
+                value: ScalarValue::Integer(20),
             },
         )
         .unwrap();
@@ -189,7 +199,7 @@ mod tests {
             2,
             &Request::Set {
                 key: "power".into(),
-                value: Number::Float(20.0),
+                value: ScalarValue::Float(20.0),
             },
         )
         .unwrap();
@@ -215,7 +225,7 @@ mod tests {
                     1,
                     &Request::Set {
                         key: "power".into(),
-                        value: Number::Float(value),
+                        value: ScalarValue::Float(value),
                     }
                 ),
                 Err(EncodeError::NonFiniteFloat)

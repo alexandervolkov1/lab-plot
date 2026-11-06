@@ -1,12 +1,12 @@
 //! Strict protocol-v1 decoding. Unknown, duplicate and incompatible fields fail closed.
-use super::{MAX_RESPONSE_FRAME_BYTES, Number};
+use super::{MAX_RESPONSE_FRAME_BYTES, Number, ScalarValue};
 use serde::de::{Deserialize, DeserializeOwned, Deserializer, Error, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reading {
-    Value { value: Number, unit: String },
+    Value { value: ScalarValue, unit: String },
     Error(String),
 }
 
@@ -18,17 +18,19 @@ pub struct Measurement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NumberType {
+pub enum ScalarType {
     Integer,
     Float,
+    Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parameter {
     pub key: String,
-    pub number_type: NumberType,
-    pub min: Number,
-    pub max: Number,
+    pub value_type: ScalarType,
+    /// Boolean bounds are explicitly null; numeric bounds retain their type.
+    pub min: Option<Number>,
+    pub max: Option<Number>,
     pub unit: String,
     pub writable: bool,
     pub poll_period_ns: Option<u64>,
@@ -115,6 +117,19 @@ impl<'de> Deserialize<'de> for Object {
 fn decode<T: DeserializeOwned>(text: &str) -> Result<T, ParseError> {
     serde_json::from_str(text).map_err(|e| ParseError(e.to_string()))
 }
+
+fn number(raw: &str) -> Result<Number, ParseError> {
+    if raw.contains(['.', 'e', 'E']) {
+        let value: f64 = decode(raw)?;
+        if value.is_finite() {
+            return Ok(Number::Float(value));
+        }
+        Err(ParseError("non-finite float".into()))
+    } else {
+        decode(raw).map(Number::Integer)
+    }
+}
+
 impl Object {
     fn take<T: DeserializeOwned>(&mut self, key: &str) -> Result<T, ParseError> {
         let raw = self
@@ -130,16 +145,23 @@ impl Object {
             Ok(None)
         }
     }
-    fn number(&mut self, key: &str) -> Result<Number, ParseError> {
+    fn bound(&mut self, key: &str) -> Result<Option<Number>, ParseError> {
         let raw: Box<RawValue> = self.take(key)?;
-        if raw.get().contains(['.', 'e', 'E']) {
-            let value: f64 = decode(raw.get())?;
-            if value.is_finite() {
-                return Ok(Number::Float(value));
-            }
-            Err(ParseError("non-finite float".into()))
+        if raw.get() == "null" {
+            Ok(None)
         } else {
-            decode(raw.get()).map(Number::Integer)
+            number(raw.get()).map(Some)
+        }
+    }
+    fn scalar(&mut self, key: &str) -> Result<ScalarValue, ParseError> {
+        let raw: Box<RawValue> = self.take(key)?;
+        match raw.get() {
+            "true" => Ok(ScalarValue::Boolean(true)),
+            "false" => Ok(ScalarValue::Boolean(false)),
+            value => number(value).map(|value| match value {
+                Number::Integer(value) => ScalarValue::Integer(value),
+                Number::Float(value) => ScalarValue::Float(value),
+            }),
         }
     }
     fn end(self) -> Result<(), ParseError> {
@@ -153,10 +175,14 @@ impl Object {
         let key = self.take("key")?;
         let completed_at_unix_ms = self.take("completed_at_unix_ms")?;
         let reading = match status {
-            "ok" => Reading::Value {
-                value: self.number("value")?,
-                unit: self.take("unit")?,
-            },
+            "ok" => {
+                let value = self.scalar("value")?;
+                let unit: String = self.take("unit")?;
+                if matches!(value, ScalarValue::Boolean(_)) && !unit.is_empty() {
+                    return Err(ParseError("Boolean unit must be empty".into()));
+                }
+                Reading::Value { value, unit }
+            }
             "error" => Reading::Error(self.take("error")?),
             _ => return Err(ParseError("invalid measurement status".into())),
         };
@@ -169,23 +195,25 @@ impl Object {
 }
 
 fn parameter(mut object: Object) -> Result<Parameter, ParseError> {
-    let number_type = match object.take::<String>("type")?.as_str() {
-        "integer" => NumberType::Integer,
-        "float" => NumberType::Float,
+    let value_type = match object.take::<String>("type")?.as_str() {
+        "integer" => ScalarType::Integer,
+        "float" => ScalarType::Float,
+        "boolean" => ScalarType::Boolean,
         _ => return Err(ParseError("invalid parameter type".into())),
     };
     let parameter = Parameter {
         key: object.take("key")?,
-        number_type,
-        min: object.number("min")?,
-        max: object.number("max")?,
+        value_type,
+        min: object.bound("min")?,
+        max: object.bound("max")?,
         unit: object.take("unit")?,
         writable: object.take("writable")?,
         poll_period_ns: object.take("poll_period_ns")?,
     };
-    let valid_range = match (parameter.min, parameter.max, number_type) {
-        (Number::Integer(a), Number::Integer(b), NumberType::Integer) => a <= b,
-        (Number::Float(a), Number::Float(b), NumberType::Float) => a <= b,
+    let valid_range = match (parameter.min, parameter.max, value_type) {
+        (Some(Number::Integer(a)), Some(Number::Integer(b)), ScalarType::Integer) => a <= b,
+        (Some(Number::Float(a)), Some(Number::Float(b)), ScalarType::Float) => a <= b,
+        (None, None, ScalarType::Boolean) => parameter.unit.is_empty(),
         _ => false,
     };
     if !valid_range {

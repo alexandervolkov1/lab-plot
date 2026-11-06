@@ -13,7 +13,7 @@ fn strict_parser_rejects_malformed_combinations_and_preserves_number_types() {
     assert_eq!(
         parsed.reading,
         Reading::Value {
-            value: Number::Integer(2),
+            value: ScalarValue::Integer(2),
             unit: "degC".into()
         }
     );
@@ -25,7 +25,7 @@ fn strict_parser_rejects_malformed_combinations_and_preserves_number_types() {
             parse_message(&raw).unwrap(),
             Incoming::Measurement(Measurement {
                 reading: Reading::Value {
-                    value: Number::Float(2.0),
+                    value: ScalarValue::Float(2.0),
                     ..
                 },
                 ..

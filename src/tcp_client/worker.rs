@@ -531,7 +531,7 @@ mod tests {
     fn worker() -> Worker {
         let request = Request::Set {
             key: "p".into(),
-            value: Number::Integer(1),
+            value: ScalarValue::Integer(1),
         };
         Worker {
             shared: Arc::new(Mutex::new(Shared {
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(
             sender.request(Request::Set {
                 key: "p".into(),
-                value: Number::Float(f64::NAN)
+                value: ScalarValue::Float(f64::NAN)
             }),
             Err(RequestError::Encode(EncodeError::NonFiniteFloat))
         );
