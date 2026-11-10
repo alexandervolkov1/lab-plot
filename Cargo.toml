@@ -12,3 +12,13 @@ steel-core = "=0.8.3"
 rfd = "=0.17.2"
 tempfile = "=3.27.0"
 schemat = { git = "https://github.com/alexandervolkov1/schemat-steel", rev = "4abe84a054ea5e8835b98e165275b44dda981d7b" }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+# tungstenite trace logs include serialized HTTP headers, even sensitive ones.
+log = { version = "0.4", features = ["max_level_warn"] }
+
+[dev-dependencies]
+rcgen = "0.14"

@@ -1,6 +1,8 @@
-//! Standalone protocol-v1 TCP client; no GUI or Steel integration.
+//! Protocol-v1 client with TCP/NDJSON and WS/WSS/Text adapters.
+//! The historical `tcp_client` module and `Client::start(SocketAddr, ...)` API remain compatible.
 //!
 //! Start with [`Client::start`], poll [`Client::try_recv`] for [`ClientEvent::Ready`],
+//! Or use [`Client::start_endpoint`] with a parsed [`Endpoint`] for WS/WSS.
 //! then clone [`Client::sender`] for producers. [`ClientSender::request`] returns
 //! the admitted request ID or an explicit rejection (nothing sent). Replies are
 //! matched by ID, while measurements arrive independently on the same socket.
@@ -24,8 +26,10 @@
 use serde_json::{Value, json};
 
 mod protocol;
+mod transport;
 mod worker;
 pub use protocol::*;
+pub use transport::{Endpoint, WebSocketOptions};
 pub use worker::*;
 
 pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024;

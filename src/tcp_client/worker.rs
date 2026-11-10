@@ -1,9 +1,12 @@
 //! One socket, one worker, bounded queues. No retries or automatic reconnects.
+use super::transport::{SendFrame, Transport};
 use super::*;
+#[cfg(test)]
+use std::io::Write;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpStream},
+    io,
+    net::SocketAddr,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, MutexGuard},
     thread::{self, JoinHandle},
@@ -58,6 +61,13 @@ impl ClientOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     Shutdown,
+    Dns,
+    Tls,
+    WebSocketHandshake,
+    WebSocketSubprotocol,
+    WebSocketProtocol,
+    WebSocketUnsupported,
+    WebSocketClosed,
     Connect(io::ErrorKind),
     Read(io::ErrorKind),
     Write(io::ErrorKind),
@@ -182,6 +192,10 @@ impl Client {
     /// through state/events; only invalid options or thread creation fail here.
     /// A numeric address avoids blocking DNS resolution during shutdown.
     pub fn start(address: SocketAddr, options: ClientOptions) -> io::Result<Self> {
+        Self::start_endpoint(address.into(), options)
+    }
+    /// Starts TCP, WS or WSS with the same worker and command engine.
+    pub fn start_endpoint(address: Endpoint, options: ClientOptions) -> io::Result<Self> {
         options.validate()?;
         let shared = Arc::new(Mutex::new(Shared {
             state: ClientState::Connecting,
@@ -193,7 +207,7 @@ impl Client {
         }));
         let worker_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
-            .name("lab-tcp-client".into())
+            .name("lab-client".into())
             .spawn(move || {
                 let mut worker = Worker {
                     shared: worker_shared,
@@ -274,15 +288,14 @@ impl Worker {
             Err(StopReason::EventQueueOverflow)
         }
     }
-    fn run(&mut self, address: SocketAddr) -> StopReason {
+    fn run(&mut self, address: Endpoint) -> StopReason {
         let options = lock(&self.shared).options.clone();
-        let mut socket = match TcpStream::connect_timeout(&address, options.connect_timeout) {
+        let mut socket = match Transport::connect(address, options.connect_timeout, &|| {
+            lock(&self.shared).state == ClientState::Stopping
+        }) {
             Ok(socket) => socket,
-            Err(e) => return StopReason::Connect(e.kind()),
+            Err(reason) => return reason,
         };
-        if let Err(e) = socket.set_nonblocking(true) {
-            return StopReason::Connect(e.kind());
-        }
         self.pending.insert(
             1,
             Pending {
@@ -296,12 +309,12 @@ impl Worker {
             },
         );
         self.writing = Some((1, 0));
-        let mut decoder = FrameDecoder::default();
-        let mut buffer = [0; 8192];
         loop {
             {
                 let mut shared = lock(&self.shared);
                 if shared.state == ClientState::Stopping {
+                    drop(shared);
+                    socket.close();
                     return StopReason::Shutdown;
                 }
                 if shared.state == ClientState::Ready
@@ -320,39 +333,20 @@ impl Worker {
                     );
                 }
             }
+            socket.turn();
             let mut progress = match self.write_pending(&mut socket) {
                 Ok(progress) => progress,
                 Err(reason) => return reason,
             };
-            match socket.read(&mut buffer) {
-                Ok(0) => {
-                    return decoder
-                        .finish()
-                        .err()
-                        .map(StopReason::Frame)
-                        .unwrap_or(StopReason::Eof);
+            let received = socket.receive();
+            progress |= !received.frames.is_empty();
+            for frame in received.frames {
+                if let Err(reason) = self.incoming(&frame) {
+                    return reason;
                 }
-                Ok(n) => {
-                    progress = true;
-                    let (frames, failure) = match decoder.push(&buffer[..n]) {
-                        Ok(frames) => (frames, None),
-                        Err(failure) => (failure.frames, Some(failure.error)),
-                    };
-                    for frame in frames {
-                        if let Err(reason) = self.incoming(&frame) {
-                            return reason;
-                        }
-                    }
-                    if let Some(error) = failure {
-                        return StopReason::Frame(error);
-                    }
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(e) => return StopReason::Read(e.kind()),
+            }
+            if let Some(reason) = received.failure {
+                return reason;
             }
             for (&id, pending) in &self.pending {
                 let timeout = if id == 1 {
@@ -374,7 +368,7 @@ impl Worker {
         }
     }
     // One bounded nonblocking write per iteration keeps incoming traffic fair.
-    fn write_pending(&mut self, socket: &mut impl Write) -> Result<bool, StopReason> {
+    fn write_pending(&mut self, socket: &mut impl SendFrame) -> Result<bool, StopReason> {
         let Some((id, offset)) = self.writing else {
             return Ok(false);
         };
@@ -386,28 +380,20 @@ impl Worker {
         // Mark before calling into I/O: an unexpected unwind must not assert
         // that a physical command definitely did not execute.
         pending.attempted = true;
-        match socket.write(&pending.command.frame.as_bytes()[offset..]) {
-            Ok(0) => Err(StopReason::Write(io::ErrorKind::WriteZero)),
-            Ok(n) => {
-                let offset = offset + n;
-                self.writing = if offset == pending.command.frame.len() {
-                    None
-                } else {
-                    Some((id, offset))
-                };
-                Ok(true)
+        let written = match socket.send_frame(&pending.command.frame, offset) {
+            Ok(written) => written,
+            Err(failure) => {
+                pending.attempted = previously_attempted || failure.attempted;
+                return Err(failure.reason);
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                pending.attempted = previously_attempted;
-                Ok(false)
-            }
-            Err(e) => Err(StopReason::Write(e.kind())),
-        }
+        };
+        pending.attempted = previously_attempted || written.attempted;
+        self.writing = if written.complete {
+            None
+        } else {
+            Some((id, written.offset))
+        };
+        Ok(written.complete || written.offset != offset)
     }
     fn incoming(&mut self, frame: &str) -> Result<(), StopReason> {
         let message = parse_message(frame).map_err(StopReason::Protocol)?;
