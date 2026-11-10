@@ -12,6 +12,17 @@
 //! (lab/get "heater_temperature")
 //! (lab/set! "power" 20) ; Integer, unlike 20.0 (Float)
 //! ```
+//! `lab/connect!` also accepts `tcp://127.0.0.1:7240`,
+//! `ws://127.0.0.1:7241/application/v1` and `wss://example.org/application/v1`.
+//! No arity or return-value change: `#t` means admission, `Ready` means hello passed.
+//! Set `LAB_PLOT_WS_ORIGIN` and/or `LAB_PLOT_WS_HEADERS` before launching the app.
+//! Headers are a JSON object, e.g. `{"Authorization":"Bearer <secret>"}`; obtain
+//! real secrets through your launcher/secret manager, never Steel source or URLs.
+//! These settings apply only to WS/WSS; the subprotocol is fixed automatically.
+//! Redirects are not followed. WSS uses WebPKI roots and validates the server name.
+//! Rust callers can add private trust anchors via `WebSocketOptions::trust_certificate`.
+//! The Steel interface has no certificate-verification bypass or custom CA setting.
+//!
 //! Network commands return positive request IDs, scoped to the connection.
 //! The GUI retains the last 200 results/errors and counts evicted entries.
 //! `outcome_unknown`/`OutcomeUnknown` must never be interpreted as non-execution.
@@ -30,7 +41,7 @@
 use crate::{
     integration::ControlSender,
     plots::PlotCommand,
-    tcp_client::{Request, ScalarValue},
+    tcp_client::{Endpoint, Request, ScalarValue},
 };
 use steel::{
     SteelVal,
@@ -140,9 +151,13 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
     engine.register_fn(
         "lab/connect!",
         move |address: String| -> Result<bool, String> {
-            tx.connect(address.parse().map_err(|_| {
-                "Expected a numeric IP:port (for example 127.0.0.1:7240)".to_string()
-            })?)
+            let endpoint = address
+                .parse::<Endpoint>()
+                .and_then(Endpoint::with_environment)
+                .map_err(|_| {
+                    "Invalid endpoint or WebSocket environment configuration".to_string()
+                })?;
+            tx.connect_endpoint(endpoint)
         },
     );
     let tx = sender.clone();

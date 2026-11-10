@@ -32,7 +32,7 @@ impl Phase {
 }
 enum Control {
     Plot(PlotCommand),
-    Connect(SocketAddr),
+    Connect(Endpoint),
     Disconnect,
 }
 struct Bridge {
@@ -66,6 +66,9 @@ impl ControlSender {
         Ok(true)
     }
     pub fn connect(&self, address: SocketAddr) -> Result<bool, String> {
+        self.connect_endpoint(address.into())
+    }
+    pub fn connect_endpoint(&self, address: Endpoint) -> Result<bool, String> {
         let mut bridge = lock(&self.shared);
         Self::capacity(&bridge)?;
         if bridge.phase != Phase::Stopped {
@@ -259,7 +262,7 @@ impl Integration {
                     self.boolean_signals.clear();
                     self.terminal_received = false;
                     plots.break_bound();
-                    match Client::start(address, self.options.clone()) {
+                    match Client::start_endpoint(address, self.options.clone()) {
                         Ok(client) => {
                             bridge.sender = Some(client.sender());
                             self.client = Some(client);

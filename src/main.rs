@@ -152,7 +152,7 @@ fn connection_status(ui: &mut egui::Ui, connection: &Integration, plots: &PlotSt
             format!("Stream stopped: {error}. Measurement continuity is not guaranteed."),
         );
     }
-    egui::CollapsingHeader::new("TCP results and subscriptions").default_open(true).show(ui, |ui| {
+    egui::CollapsingHeader::new("Server results and subscriptions").default_open(true).show(ui, |ui| {
         ui.label(format!("Subscriptions: {}", connection.subscriptions.iter().cloned().collect::<Vec<_>>().join(", ")));
         ui.label("Boolean signals");
         if connection.boolean_signals.is_empty() { ui.weak("No current Boolean observations"); }
