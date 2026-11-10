@@ -1,6 +1,7 @@
 //! Framing and connection establishment only. Request IDs/pending live in Worker.
 use super::{
-    FrameDecoder, FrameError, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, StopReason,
+    FrameDecoder, FrameError, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, ParseError,
+    StopReason,
 };
 use std::{
     fmt,
@@ -25,6 +26,7 @@ const WAIT: Duration = Duration::from_millis(2);
 const WS_WRITE_LIMIT: usize = MAX_REQUEST_FRAME_BYTES + 1024;
 
 /// Never formats the URI or headers: they can contain credentials.
+/// Plain WS is restricted to resolved loopback addresses and a loopback TCP peer.
 #[derive(Clone)]
 pub struct Endpoint {
     address: Address,
@@ -236,8 +238,8 @@ impl Transport {
         stopped: &impl Fn() -> bool,
     ) -> Result<Self, StopReason> {
         let deadline = Instant::now() + timeout;
-        let socket = match &endpoint.address {
-            Address::Tcp(address) => connect_socket(vec![*address], deadline, stopped)?,
+        let addresses = match &endpoint.address {
+            Address::Tcp(address) => vec![*address],
             Address::Ws(uri) => {
                 let host = uri
                     .host()
@@ -250,10 +252,23 @@ impl Transport {
                     } else {
                         80
                     });
-                let addresses = resolve(host, port, deadline, stopped)?;
-                connect_socket(addresses, deadline, stopped)?
+                resolve(host, port, deadline, stopped)?
             }
         };
+        Self::connect_resolved(endpoint, addresses, deadline, stopped)
+    }
+    // Separate resolution from connection so tests can supply controlled DNS
+    // answers without changing system DNS or contacting external servers.
+    fn connect_resolved(
+        endpoint: Endpoint,
+        mut addresses: Vec<SocketAddr>,
+        deadline: Instant,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Self, StopReason> {
+        if let Address::Ws(uri) = &endpoint.address {
+            addresses = websocket_addresses(uri, addresses)?;
+        }
+        let socket = connect_socket(addresses, deadline, stopped)?;
         socket
             .set_nonblocking(true)
             .map_err(|e| StopReason::Connect(e.kind()))?;
@@ -264,6 +279,12 @@ impl Transport {
             });
         };
         check(deadline, stopped)?;
+        // Inspect the actual peer BEFORE constructing the HTTP request, attaching
+        // custom headers or starting any handshake. Never trust "localhost" alone.
+        let peer = socket
+            .peer_addr()
+            .map_err(|e| StopReason::Connect(e.kind()))?;
+        check_websocket_peer(&uri, peer)?;
         let stream = if uri.scheme_str() == Some("wss") {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -424,6 +445,33 @@ impl Transport {
             }
         }
     }
+}
+
+fn insecure_websocket() -> StopReason {
+    // Use the existing error API and a constant diagnostic: never echo a URI,
+    // HTTP headers, DNS answers or server-supplied text containing credentials.
+    StopReason::Protocol(ParseError(
+        "Unencrypted ws:// is allowed only for loopback addresses; use wss:// for remote servers"
+            .into(),
+    ))
+}
+fn websocket_addresses(
+    uri: &Uri,
+    mut addresses: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, StopReason> {
+    if uri.scheme_str() == Some("ws") {
+        addresses.retain(|address| address.ip().is_loopback());
+        if addresses.is_empty() {
+            return Err(insecure_websocket());
+        }
+    }
+    Ok(addresses)
+}
+fn check_websocket_peer(uri: &Uri, peer: SocketAddr) -> Result<(), StopReason> {
+    if uri.scheme_str() == Some("ws") && !peer.ip().is_loopback() {
+        return Err(insecure_websocket());
+    }
+    Ok(())
 }
 impl SendFrame for Transport {
     fn send_frame(&mut self, frame: &str, offset: usize) -> Result<Written, WriteFailure> {
@@ -685,6 +733,208 @@ mod tests {
         },
     };
     use tungstenite::protocol::Role;
+
+    #[test]
+    fn ws_security_filters_all_dns_answers_and_checks_actual_peer() {
+        let local = [
+            "127.0.0.1:80",
+            "127.42.5.6:80",
+            "127.255.255.255:80",
+            "[::1]:80",
+        ]
+        .map(|s| s.parse::<SocketAddr>().unwrap());
+        let remote = [
+            "0.0.0.0:80",
+            "192.0.2.1:80",
+            "10.0.0.1:80",
+            "[2001:db8::1]:80",
+            "[::ffff:127.0.0.1]:80",
+        ]
+        .map(|s| s.parse::<SocketAddr>().unwrap());
+        // Neither the spelling localhost nor a numeric URI bypasses DNS/peer checks.
+        for name in ["localhost", "remote.invalid", "127.0.0.1"] {
+            let uri: Uri = format!("ws://{name}/?private=uri-secret").parse().unwrap();
+            let mixed = remote.iter().chain(&local).copied().collect();
+            assert_eq!(websocket_addresses(&uri, mixed).unwrap(), local);
+            assert_eq!(
+                websocket_addresses(&uri, remote.to_vec()),
+                Err(insecure_websocket())
+            );
+            assert_eq!(websocket_addresses(&uri, vec![]), Err(insecure_websocket()));
+            for peer in local {
+                assert_eq!(check_websocket_peer(&uri, peer), Ok(()));
+            }
+            for peer in remote {
+                assert_eq!(check_websocket_peer(&uri, peer), Err(insecure_websocket()));
+            }
+        }
+        let wss: Uri = "wss://remote.invalid/".parse().unwrap();
+        assert_eq!(websocket_addresses(&wss, remote.to_vec()).unwrap(), remote);
+        for peer in remote {
+            assert_eq!(check_websocket_peer(&wss, peer), Ok(()));
+        }
+    }
+
+    #[test]
+    fn ws_security_nonlocal_localhost_dns_is_rejected_before_connect() {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for header in [None, Some("Authorization"), Some("X-Token")] {
+            let mut options = WebSocketOptions::default();
+            if let Some(header) = header {
+                options = options.header(header, "header-secret").unwrap();
+            }
+            let endpoint = "ws://localhost/application/v1?private=uri-secret"
+                .parse::<Endpoint>()
+                .unwrap()
+                .with_websocket_options(options);
+            let result = Transport::connect_resolved(
+                endpoint,
+                vec![listener.local_addr().unwrap()],
+                Instant::now() + Duration::from_secs(1),
+                &|| false,
+            );
+            assert!(matches!(result, Err(reason) if reason == insecure_websocket()));
+            // Not even a TCP connection is admitted, hence no HTTP bytes can escape.
+            assert!(matches!(listener.accept(), Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn ws_security_remote_wss_name_keeps_certificate_validation() {
+        // Controlled DNS: remote.invalid resolves to our loopback TLS fixture.
+        // No system DNS changes or connections to arbitrary external servers.
+        for (trusted, correct_name) in [(true, true), (false, true), (true, false)] {
+            let identity = rcgen::generate_simple_self_signed(vec![
+                if correct_name {
+                    "remote.invalid"
+                } else {
+                    "wrong.invalid"
+                }
+                .into(),
+            ])
+            .unwrap();
+            let cert = identity.cert.der().clone();
+            let key =
+                rustls::pki_types::PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.into())
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let task = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline);
+                            thread::sleep(WAIT);
+                        }
+                        Err(e) => panic!("fixture accept failed: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let tls = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+                    stream,
+                );
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    |request: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        assert_eq!(
+                            request.headers()["authorization"],
+                            "Bearer controlled-secret"
+                        );
+                        response.headers_mut().insert(
+                            "sec-websocket-protocol",
+                            HeaderValue::from_static(SUBPROTOCOL),
+                        );
+                        Ok(response)
+                    };
+                match tungstenite::accept_hdr(tls, callback) {
+                    Ok(mut socket) => {
+                        assert!(trusted && correct_name);
+                        assert_eq!(
+                            socket.read().unwrap().into_text().unwrap(),
+                            r#"{"id":1,"op":"hello"}"#
+                        );
+                        socket
+                            .send(Message::Text(
+                                r#"{"id":1,"status":"ok","protocol":"lab-server","version":1}"#
+                                    .into(),
+                            ))
+                            .unwrap();
+                        let _ = socket.read();
+                    }
+                    Err(_) => assert!(!trusted || !correct_name),
+                }
+                assert!(matches!(listener.accept(), Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+            });
+            let mut options = WebSocketOptions::default()
+                .header("Authorization", "Bearer controlled-secret")
+                .unwrap();
+            if trusted {
+                options = options.trust_certificate(cert.to_vec()).unwrap();
+            }
+            let endpoint = "wss://remote.invalid/application/v1"
+                .parse::<Endpoint>()
+                .unwrap()
+                .with_websocket_options(options);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let result = Transport::connect_resolved(endpoint, vec![address], deadline, &|| false);
+            if trusted && correct_name {
+                let mut transport =
+                    result.unwrap_or_else(|reason| panic!("WSS failed: {reason:?}"));
+                loop {
+                    assert!(Instant::now() < deadline);
+                    transport.turn();
+                    if transport
+                        .send_frame("{\"id\":1,\"op\":\"hello\"}\n", 0)
+                        .unwrap()
+                        .complete
+                    {
+                        break;
+                    }
+                    thread::sleep(WAIT);
+                }
+                loop {
+                    assert!(Instant::now() < deadline);
+                    transport.turn();
+                    let received = transport.receive();
+                    assert!(received.failure.is_none());
+                    if !received.frames.is_empty() {
+                        assert!(matches!(
+                            super::super::parse_message(&received.frames[0]).unwrap(),
+                            super::super::Incoming::Response(super::super::Response {
+                                data: super::super::ResponseData::Hello { version: 1, .. },
+                                ..
+                            })
+                        ));
+                        break;
+                    }
+                    thread::sleep(WAIT);
+                }
+                transport.close();
+            } else {
+                assert!(matches!(result, Err(StopReason::Tls)));
+            }
+            task.join().unwrap();
+        }
+    }
 
     #[test]
     fn dns_blackhole_is_cancellable_and_has_total_deadline() {

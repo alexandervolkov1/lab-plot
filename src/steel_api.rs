@@ -19,6 +19,8 @@
 //! Headers are a JSON object, e.g. `{"Authorization":"Bearer <secret>"}`; obtain
 //! real secrets through your launcher/secret manager, never Steel source or URLs.
 //! These settings apply only to WS/WSS; the subprotocol is fixed automatically.
+//! Plain `ws://` is restricted to loopback (127/8, ::1, or names resolving there).
+//! Remote WebSocket servers require `wss://`, even without custom headers.
 //! Redirects are not followed. WSS uses WebPKI roots and validates the server name.
 //! Rust callers can add private trust anchors via `WebSocketOptions::trust_certificate`.
 //! The Steel interface has no certificate-verification bypass or custom CA setting.

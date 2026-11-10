@@ -92,6 +92,167 @@ fn ready(endpoint: Endpoint, options: ClientOptions) -> Client {
 }
 
 #[test]
+fn ws_security_ipv4_ipv6_and_localhost_reach_ready() {
+    for (bind, host) in [
+        ("127.0.0.1:0", "127.0.0.1"),
+        ("127.42.0.7:0", "127.42.0.7"),
+        ("[::1]:0", "[::1]"),
+        ("127.0.0.1:0", "localhost"),
+    ] {
+        let listener = std::net::TcpListener::bind(bind).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = thread::spawn(move || {
+            let start = Instant::now();
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(start.elapsed() < WAIT);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(WAIT)).unwrap();
+            socket.set_write_timeout(Some(WAIT)).unwrap();
+            let mut ws = tungstenite::accept_hdr(socket, upgrade).unwrap();
+            hello(&mut ws);
+            assert!(matches!(ws.read(), Ok(Message::Close(_))));
+        });
+        let client = ready(
+            format!("ws://{host}:{port}/application/v1")
+                .parse()
+                .unwrap(),
+            ClientOptions::default(),
+        );
+        client.request_shutdown();
+        assert_eq!(stopped(&client).1, StopReason::Shutdown);
+        task.join().unwrap();
+    }
+}
+
+fn assert_loopback_refusal(reason: &StopReason) {
+    let text = format!("{reason:?}");
+    assert!(text.contains("loopback") && text.contains("wss://"));
+    for secret in ["uri-secret", "header-secret", "Authorization", "X-Token"] {
+        assert!(!text.contains(secret));
+    }
+}
+
+#[test]
+fn ws_security_nonloopback_refusal_sends_no_headers_and_stops_gui_client() {
+    use lab_plot::{
+        integration::{Integration, Phase},
+        plots::{PlotCommand, PlotState},
+    };
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for header in [None, Some("Authorization"), Some("X-Token")] {
+        let mut options = WebSocketOptions::default();
+        if let Some(header) = header {
+            options = options.header(header, "header-secret").unwrap();
+        }
+        let endpoint = format!(
+            "ws://{}/application/v1?private=uri-secret",
+            listener.local_addr().unwrap()
+        )
+        .parse::<Endpoint>()
+        .unwrap()
+        .with_websocket_options(options);
+        let client = Client::start_endpoint(endpoint.clone(), ClientOptions::default()).unwrap();
+        let (events, reason) = stopped(&client);
+        assert!(events.is_empty());
+        assert_loopback_refusal(&reason);
+        assert_eq!(client.state(), ClientState::Stopped(reason));
+        assert!(client.sender().request(Request::Ping).is_err());
+        drop(client);
+        let mut integration = Integration::default();
+        let mut plots = PlotState::default();
+        let sender = integration.sender();
+        assert!(sender.connect_endpoint(endpoint).unwrap());
+        assert_eq!(sender.status(), Phase::Connecting);
+        let start = Instant::now();
+        loop {
+            // GUI work must still be admitted and applied while connection fails.
+            sender
+                .plot(PlotCommand::Point {
+                    name: "manual".into(),
+                    time: 1.0,
+                    value: 2.0,
+                })
+                .unwrap();
+            let frame = Instant::now();
+            assert!(integration.update(&mut plots) <= 256);
+            assert!(frame.elapsed() < Duration::from_secs(1));
+            if integration.phase() == Phase::Stopped {
+                break;
+            }
+            assert!(start.elapsed() < WAIT);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!plots.series["manual"].points.is_empty());
+        assert!(integration.reason.as_ref().unwrap().contains("use wss://"));
+        for entry in &integration.journal {
+            let text = entry.text();
+            assert!(!text.contains("uri-secret") && !text.contains("header-secret"));
+        }
+        integration.begin_close();
+        assert!(integration.is_closed());
+        // The fixture is reachable locally, but its unspecified (non-loopback)
+        // destination must be refused before even connecting, regardless of headers.
+        assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+    }
+}
+
+#[test]
+fn ws_security_environment_headers_are_not_sent() {
+    // Isolate environment changes in a child process; no unsafe set_var or races
+    // with parallel tests / the user's real environment.
+    if std::env::var_os("LAB_PLOT_SECURITY_TEST_CHILD").is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ws_security_environment_headers_are_not_sent"])
+            .env("LAB_PLOT_SECURITY_TEST_CHILD", "1")
+            .env(
+                "LAB_PLOT_WS_HEADERS",
+                r#"{"Authorization":"header-secret","X-Token":"header-secret"}"#,
+            )
+            .env("LAB_PLOT_WS_ORIGIN", "http://localhost")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if start.elapsed() > WAIT {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("child test timed out");
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "ws://{}/application/v1?private=uri-secret",
+        listener.local_addr().unwrap()
+    )
+    .parse::<Endpoint>()
+    .unwrap()
+    .with_environment()
+    .unwrap();
+    let client = Client::start_endpoint(endpoint, ClientOptions::default()).unwrap();
+    assert_loopback_refusal(&stopped(&client).1);
+    assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
 fn websocket_headers_hello_scalars_out_of_order_and_independent_events() {
     let (done_tx, done_rx) = mpsc::channel();
     let (address, task) = mock(move |socket| {
