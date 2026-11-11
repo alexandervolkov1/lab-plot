@@ -1,6 +1,109 @@
 use lab_plot::tcp_client::*;
 use serde_json::{Value, json};
 
+#[test]
+fn action_encoding_bounds_include_json_escaping_and_overhead() {
+    let request = |key| Request::InvokeAction { key };
+    let frame = encode_request(17, &request("furnace1/apply".into())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&frame).unwrap(),
+        json!({"id":17,"op":"invoke_action","key":"furnace1/apply"})
+    );
+    assert!(frame.ends_with('\n'));
+    let overhead = encode_request(17, &request(String::new())).unwrap().len() - 1;
+    let exact = "x".repeat(MAX_REQUEST_FRAME_BYTES - overhead);
+    assert_eq!(
+        encode_request(17, &request(exact.clone())).unwrap().len(),
+        MAX_REQUEST_FRAME_BYTES + 1
+    );
+    for key in [
+        format!("{exact}x"),
+        "x".repeat(MAX_REQUEST_FRAME_BYTES + 1),
+        "\n".repeat(MAX_REQUEST_FRAME_BYTES / 2),
+        "я".repeat(MAX_REQUEST_FRAME_BYTES / 2),
+    ] {
+        assert_eq!(
+            encode_request(17, &request(key)),
+            Err(EncodeError::FrameTooLong)
+        );
+    }
+    let frame = encode_request(17, &request("a\n\"b".into())).unwrap();
+    assert_eq!(frame.bytes().filter(|b| *b == b'\n').count(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&frame).unwrap()["key"],
+        "a\n\"b"
+    );
+    assert_eq!(
+        encode_request(0, &request("a".into())),
+        Err(EncodeError::InvalidId)
+    );
+}
+
+#[test]
+fn describe_supports_legacy_and_extended_catalogs_without_changing_parameters() {
+    let parameter = json!({"key":"enabled","type":"boolean","min":null,"max":null,"unit":"","writable":true,"poll_period_ns":null});
+    for parameters in [json!([]), json!([parameter])] {
+        let legacy = json!({"id":2,"status":"ok","parameters":parameters});
+        let Incoming::Response(old) = parse_message(&legacy.to_string()).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(old.data, ResponseData::Parameters(_)));
+        assert_eq!(old.data.actions(), Some([].as_slice()));
+        for actions in [
+            vec![],
+            vec![ActionDescription {
+                key: "furnace1/apply".into(),
+                description: "Apply staged configuration".into(),
+            }],
+        ] {
+            let mut extended = legacy.clone();
+            extended["actions"] = json!(
+                actions
+                    .iter()
+                    .map(|a| json!({"key":a.key,"description":a.description}))
+                    .collect::<Vec<_>>()
+            );
+            let Incoming::Response(new) = parse_message(&extended.to_string()).unwrap() else {
+                panic!()
+            };
+            assert!(matches!(new.data, ResponseData::Description { .. }));
+            assert_eq!(new.data.parameters(), old.data.parameters());
+            assert_eq!(new.data.actions(), Some(actions.as_slice()));
+            assert_eq!(new.status(), Status::Ok);
+        }
+    }
+    assert_eq!(ResponseData::Ack.parameters(), None);
+    assert_eq!(ResponseData::Ack.actions(), None);
+}
+
+#[test]
+fn actions_remain_strict_at_every_object_level() {
+    for bad in [
+        r#"{"id":2,"status":"ok","actions":[]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":null}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":{}}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[],"actions":[]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"parameters":[],"actions":[]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[],"extra":0}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[],"keys":[]}"#,
+        r#"{"id":2,"status":"error","error":"bad","parameters":[],"actions":[]}"#,
+        r#"{"id":2,"status":"ok","protocol":"lab-server","version":1,"actions":[]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":"a","key":"b","description":"d"}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":"a","description":"d","description":"e"}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":"a","description":"d","extra":1}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":"a"}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"description":"d"}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":1,"description":"d"}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[{"key":"a","description":null}]}"#,
+        r#"{"id":2,"status":"ok","parameters":[],"actions":[false]}"#,
+        r#"{"id":2,"status":"ok","parameters":[{"key":"a","key":"b"}],"actions":[]}"#,
+    ] {
+        assert!(parse_message(bad).is_err(), "{bad}");
+    }
+    let oversized = json!({"id":2,"status":"ok","parameters":[],"actions":[{"key":"a","description":"x".repeat(MAX_RESPONSE_FRAME_BYTES)}]});
+    assert!(parse_message(&oversized.to_string()).is_err());
+}
+
 fn measurement(key: &str, value: Value) -> Value {
     json!({"event":"measurement","status":"ok","key":key,"value":value,"unit":"degC","completed_at_unix_ms":123})
 }

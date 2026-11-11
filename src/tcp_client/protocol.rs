@@ -37,6 +37,12 @@ pub struct Parameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDescription {
+    pub key: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerError {
     pub error: String,
     pub key: Option<String>,
@@ -45,12 +51,42 @@ pub struct ServerError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseData {
     Ack,
-    Hello { protocol: String, version: u64 },
+    Hello {
+        protocol: String,
+        version: u64,
+    },
+    /// Legacy describe response, without an actions field. Kept for API compatibility.
     Parameters(Vec<Parameter>),
+    /// Extended describe response, including an explicitly present actions array.
+    Description {
+        parameters: Vec<Parameter>,
+        actions: Vec<ActionDescription>,
+    },
     Measurement(Measurement),
     Subscriptions(Vec<String>),
-    NoData { key: String },
+    NoData {
+        key: String,
+    },
     Error(ServerError),
+}
+
+impl ResponseData {
+    /// Parameters from either generation of the describe protocol.
+    pub fn parameters(&self) -> Option<&[Parameter]> {
+        match self {
+            Self::Parameters(parameters) | Self::Description { parameters, .. } => Some(parameters),
+            _ => None,
+        }
+    }
+
+    /// Legacy servers describe no actions; non-describe responses return None.
+    pub fn actions(&self) -> Option<&[ActionDescription]> {
+        match self {
+            Self::Parameters(_) => Some(&[]),
+            Self::Description { actions, .. } => Some(actions),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +259,15 @@ fn parameter(mut object: Object) -> Result<Parameter, ParseError> {
     Ok(parameter)
 }
 
+fn action(mut object: Object) -> Result<ActionDescription, ParseError> {
+    let action = ActionDescription {
+        key: object.take("key")?,
+        description: object.take("description")?,
+    };
+    object.end()?;
+    Ok(action)
+}
+
 /// Decode one complete UTF-8 frame (without LF), bounded to 64 KiB.
 pub fn parse_message(frame: &str) -> Result<Incoming, ParseError> {
     if frame.len() > MAX_RESPONSE_FRAME_BYTES {
@@ -247,12 +292,17 @@ pub fn parse_message(frame: &str) -> Result<Incoming, ParseError> {
             },
             "ok" if object.0.contains_key("parameters") => {
                 let objects: Vec<Object> = object.take("parameters")?;
-                ResponseData::Parameters(
-                    objects
-                        .into_iter()
-                        .map(parameter)
-                        .collect::<Result<_, _>>()?,
-                )
+                let parameters = objects
+                    .into_iter()
+                    .map(parameter)
+                    .collect::<Result<_, _>>()?;
+                match object.optional::<Vec<Object>>("actions")? {
+                    Some(objects) => ResponseData::Description {
+                        parameters,
+                        actions: objects.into_iter().map(action).collect::<Result<_, _>>()?,
+                    },
+                    None => ResponseData::Parameters(parameters),
+                }
             }
             "ok" if object.0.contains_key("keys") => {
                 ResponseData::Subscriptions(object.take("keys")?)

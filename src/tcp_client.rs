@@ -13,14 +13,15 @@
 //! A termination-only reserve of at most 130 events preserves final request
 //! results. Keep draining `try_recv` through `ClientEvent::Stopped`.
 //!
-//! A `set` rejected locally or reported as [`RequestFailure::NotSent`] cannot
-//! execute. A sent `set` without a reliable reply yields `OutcomeUnknown`.
+//! A `set` or `invoke_action` rejected locally or reported as
+//! [`RequestFailure::NotSent`] cannot execute. Once sent, either operation
+//! without a reliable reply yields `OutcomeUnknown`.
 //! Server errors remain explicit in [`ResponseData::Error`]: `runtime_timeout`
 //! means execution never started; `outcome_unknown` means it may have started.
 //! No request is retried. EOF never proves stream completeness.
 //!
 //! Connection/hello timeouts default to 3 seconds; pending requests to 15 seconds.
-//! A local timeout closes the connection and preserves uncertainty for sent sets.
+//! A local timeout closes the connection and preserves uncertainty for sent mutations.
 //! [`Client::request_shutdown`] only signals; [`Client::shutdown`] and Drop join
 //! the worker (potentially waiting for the bounded connection attempt).
 use serde_json::{Value, json};
@@ -55,6 +56,7 @@ pub enum Request {
     Describe,
     Get { key: String },
     Set { key: String, value: ScalarValue },
+    InvokeAction { key: String },
     Subscribe { keys: Vec<String> },
     Unsubscribe { keys: Vec<String> },
 }
@@ -73,7 +75,9 @@ pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError>
 
     // Bound temporary serialization allocations as well as the resulting frame.
     let payload_size = match request {
-        Request::Get { key } | Request::Set { key, .. } => key.len(),
+        Request::Get { key } | Request::Set { key, .. } | Request::InvokeAction { key } => {
+            key.len()
+        }
         Request::Subscribe { keys } | Request::Unsubscribe { keys } => keys
             .iter()
             .try_fold(0usize, |size, key| {
@@ -100,6 +104,12 @@ pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError>
         Request::Get { key } => json!({
             "id": id,
             "op": "get",
+            "key": key
+        }),
+
+        Request::InvokeAction { key } => json!({
+            "id": id,
+            "op": "invoke_action",
             "key": key
         }),
 

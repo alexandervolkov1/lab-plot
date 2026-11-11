@@ -97,9 +97,9 @@ pub enum ClientState {
 pub enum RequestFailure {
     /// No write of this request was attempted; execution is impossible.
     NotSent,
-    /// A set may have reached the server. Do not retry automatically.
+    /// A set or action may have reached the server. Do not retry automatically.
     OutcomeUnknown,
-    /// A non-set request was sent but no trustworthy response was received.
+    /// A non-mutating request was sent but no trustworthy response was received.
     ResponseUnavailable,
 }
 
@@ -469,7 +469,10 @@ impl Worker {
             }
             let failure = if !pending.attempted {
                 RequestFailure::NotSent
-            } else if matches!(pending.command.request, Some(Request::Set { .. })) {
+            } else if matches!(
+                pending.command.request,
+                Some(Request::Set { .. } | Request::InvokeAction { .. })
+            ) {
                 RequestFailure::OutcomeUnknown
             } else {
                 RequestFailure::ResponseUnavailable
@@ -493,13 +496,16 @@ impl Worker {
 fn matches_request(request: &Request, response: &ResponseData) -> bool {
     if let ResponseData::Error(error) = response {
         return match (&error.key, request) {
-            (Some(actual), Request::Get { key } | Request::Set { key, .. }) => actual == key,
+            (
+                Some(actual),
+                Request::Get { key } | Request::Set { key, .. } | Request::InvokeAction { key },
+            ) => actual == key,
             _ => true,
         };
     }
     match (request, response) {
-        (Request::Ping | Request::Set { .. }, ResponseData::Ack)
-        | (Request::Describe, ResponseData::Parameters(_))
+        (Request::Ping | Request::Set { .. } | Request::InvokeAction { .. }, ResponseData::Ack)
+        | (Request::Describe, ResponseData::Parameters(_) | ResponseData::Description { .. })
         | (
             Request::Subscribe { .. } | Request::Unsubscribe { .. },
             ResponseData::Subscriptions(_),
@@ -547,6 +553,71 @@ mod tests {
         result: io::Result<usize>,
         bytes: Vec<u8>,
         panic: bool,
+    }
+    #[test]
+    fn action_write_attempts_and_unwind_preserve_uncertainty() {
+        for mode in ["unsent", "blocked", "partial", "error", "panic"] {
+            let mut worker = worker();
+            let request = Request::InvokeAction {
+                key: "furnace1/apply".into(),
+            };
+            let command = &mut worker.pending.get_mut(&2).unwrap().command;
+            command.frame = encode_request(2, &request).unwrap();
+            command.request = Some(request);
+            let mut writer = Writer {
+                result: match mode {
+                    "blocked" => Err(io::ErrorKind::WouldBlock.into()),
+                    "error" => Err(io::ErrorKind::BrokenPipe.into()),
+                    _ => Ok(3),
+                },
+                bytes: vec![],
+                panic: mode == "panic",
+            };
+            if mode != "unsent" {
+                let _ = catch_unwind(AssertUnwindSafe(|| worker.write_pending(&mut writer)));
+            }
+            worker.finish(StopReason::Shutdown);
+            assert_eq!(
+                lock(&worker.shared).terminal[0],
+                ClientEvent::RequestFailed {
+                    id: 2,
+                    failure: if matches!(mode, "unsent" | "blocked") {
+                        RequestFailure::NotSent
+                    } else {
+                        RequestFailure::OutcomeUnknown
+                    },
+                }
+            );
+            assert_eq!(lock(&worker.shared).terminal.len(), 2);
+        }
+    }
+
+    #[test]
+    fn describe_variants_only_match_describe_and_actions_accept_keyless_errors() {
+        let action = Request::InvokeAction {
+            key: "furnace1/apply".into(),
+        };
+        for description in [
+            ResponseData::Parameters(vec![]),
+            ResponseData::Description {
+                parameters: vec![],
+                actions: vec![],
+            },
+        ] {
+            assert!(matches_request(&Request::Describe, &description));
+            assert!(!matches_request(&Request::Ping, &description));
+            assert!(!matches_request(&action, &description));
+        }
+        assert!(!matches_request(&Request::Describe, &ResponseData::Ack));
+        for error in ["unknown_key", "runtime_timeout", "outcome_unknown"] {
+            assert!(matches_request(
+                &action,
+                &ResponseData::Error(ServerError {
+                    error: error.into(),
+                    key: None
+                })
+            ));
+        }
     }
     impl Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
