@@ -66,6 +66,148 @@ fn has_result(connection: &Integration, id: u64) -> bool {
         .any(|entry| entry.request_id() == Some(id))
 }
 
+#[test]
+fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_reconnect() {
+    let (gate_tx, gate_rx) = mpsc::channel();
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let (address, server) = mock(move |mut socket| {
+        hello(&mut socket);
+        assert_eq!(read(&mut socket), json!({"id":2,"op":"describe"}));
+        for id in 3..=6 {
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":id,"op":"invoke_action","key":"furnace1/apply"})
+            );
+        }
+        seen_tx.send(()).unwrap();
+        gate_rx.recv_timeout(WAIT).unwrap();
+        send(
+            &mut socket,
+            json!({"id":2,"status":"ok","parameters":[],"actions":[{"key":"furnace1/apply","description":"Apply staged configuration"}]}),
+        );
+        send(&mut socket, json!({"id":3,"status":"ok"}));
+        for (id, error) in [
+            (4, "unknown_key"),
+            (5, "runtime_timeout"),
+            (6, "outcome_unknown"),
+        ] {
+            send(
+                &mut socket,
+                json!({"id":id,"status":"error","error":error,"key":"furnace1/apply"}),
+            );
+        }
+        assert_eq!(
+            read(&mut socket),
+            json!({"id":7,"op":"invoke_action","key":"furnace1/apply"})
+        );
+        // Drop the connection after receiving an action, without an ACK.
+    });
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let steel = SteelThread::new(connection.sender());
+    for source in ["(lab/describe)", r#"(lab/invoke-action! "furnace1/apply")"#] {
+        assert!(steel.eval(source).is_err());
+    }
+    steel
+        .eval(&format!("(lab/connect! \"{address}\")"))
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Ready
+    });
+    for source in [
+        "(lab/invoke-action! #t)",
+        "(lab/invoke-action!)",
+        "(lab/describe 1)",
+    ] {
+        assert!(steel.eval(source).is_err());
+    }
+    assert!(
+        steel
+            .eval(&format!(
+                "(lab/invoke-action! \"{}\")",
+                "x".repeat(MAX_REQUEST_FRAME_BYTES)
+            ))
+            .is_err()
+    );
+    assert_eq!(steel.eval(r#"(lab/describe) (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply")"#).unwrap(), vec!["2","3","4","5","6"]);
+    seen_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(steel.eval("(+ 20 22)").unwrap(), vec!["42"]);
+    connection.update(&mut plots);
+    assert!(!has_result(&connection, 2));
+    assert!(!has_result(&connection, 3));
+    gate_tx.send(()).unwrap();
+    pump(&mut connection, &mut plots, |c, _| has_result(c, 6));
+    for (id, text) in [
+        (2, "Apply staged configuration"),
+        (3, "Ack"),
+        (4, "unknown_key"),
+        (5, "runtime_timeout"),
+        (6, "outcome_unknown"),
+    ] {
+        let entries: Vec<_> = connection
+            .journal
+            .iter()
+            .filter(|e| e.request_id() == Some(id))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].text().contains(text));
+    }
+    assert_eq!(
+        steel
+            .eval(r#"(lab/invoke-action! "furnace1/apply")"#)
+            .unwrap(),
+        vec!["7"]
+    );
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Stopped
+    });
+    assert!(
+        connection
+            .journal
+            .iter()
+            .any(|e| e.request_id() == Some(7) && e.text().contains("OutcomeUnknown"))
+    );
+    server.join().unwrap();
+
+    let (address, server) = mock(|mut socket| {
+        hello(&mut socket);
+        // The new connection receives only explicitly submitted commands.
+        assert_eq!(read(&mut socket), json!({"id":2,"op":"describe"}));
+        send(&mut socket, json!({"id":2,"status":"ok","parameters":[]}));
+        assert_eq!(read(&mut socket), json!({"id":3,"op":"get","key":"p"}));
+        send(&mut socket, json!({"id":3,"status":"no_data","key":"p"}));
+        until_closed(&mut socket);
+    });
+    steel
+        .eval(&format!("(lab/connect! \"{address}\")"))
+        .unwrap();
+    pump(&mut connection, &mut plots, |c, _| {
+        c.phase() == Phase::Ready
+    });
+    assert_eq!(
+        steel.eval(r#"(lab/describe) (lab/get "p")"#).unwrap(),
+        vec!["2", "3"]
+    );
+    pump(&mut connection, &mut plots, |c, _| {
+        c.journal
+            .iter()
+            .any(|e| e.connection == 2 && e.request_id() == Some(3))
+    });
+    close(&mut connection, &mut plots);
+    assert!(plots.series.is_empty());
+    for id in 2..=7 {
+        assert_eq!(
+            connection
+                .journal
+                .iter()
+                .filter(|e| e.connection == 1 && e.request_id() == Some(id))
+                .count(),
+            1
+        );
+    }
+    server.join().unwrap();
+}
+
 fn observation(key: &str, value: serde_json::Value, time: u64) -> serde_json::Value {
     json!({"event":"measurement","status":"ok","key":key,"value":value,"unit":"","completed_at_unix_ms":time})
 }

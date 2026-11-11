@@ -11,6 +11,8 @@
 //! (lab/subscribe! '("heater_temperature" "sample_temperature"))
 //! (lab/get "heater_temperature")
 //! (lab/set! "power" 20) ; Integer, unlike 20.0 (Float)
+//! (lab/describe) ; Parameters and available actions appear in the GUI journal
+//! (lab/invoke-action! "furnace1/apply")
 //! ```
 //! `lab/connect!` also accepts `tcp://127.0.0.1:7240`,
 //! `ws://127.0.0.1:7241/application/v1` and `wss://example.org/application/v1`.
@@ -177,6 +179,14 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
     let tx = sender.clone();
     engine.register_fn("lab/get", move |key: String| {
         tx.request(Request::Get { key }).map(request_id)
+    });
+    let tx = sender.clone();
+    engine.register_fn("lab/describe", move || {
+        tx.request(Request::Describe).map(request_id)
+    });
+    let tx = sender.clone();
+    engine.register_fn("lab/invoke-action!", move |key: String| {
+        tx.request(Request::InvokeAction { key }).map(request_id)
     });
     engine.register_fn(
         "lab/set!",
