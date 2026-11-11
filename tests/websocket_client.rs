@@ -678,6 +678,11 @@ fn wss_validates_trust_and_hostname_with_controlled_certificate() {
                 Ok(mut ws) => {
                     assert!(trusted && correct_name);
                     hello(&mut ws);
+                    assert_eq!(
+                        read(&mut ws),
+                        json!({"id":2,"op":"invoke_action","key":"furnace1/apply"})
+                    );
+                    send(&mut ws, json!({"id":2,"status":"ok"}));
                     done_rx.recv_timeout(WAIT).unwrap();
                 }
                 Err(_) => assert!(!trusted || !correct_name),
@@ -697,6 +702,19 @@ fn wss_validates_trust_and_hostname_with_controlled_certificate() {
         .unwrap();
         if trusted && correct_name {
             assert_eq!(event(&client), ClientEvent::Ready);
+            assert_eq!(
+                client.sender().request(Request::InvokeAction {
+                    key: "furnace1/apply".into()
+                }),
+                Ok(2)
+            );
+            assert_eq!(
+                event(&client),
+                ClientEvent::Response(Response {
+                    id: 2,
+                    data: ResponseData::Ack
+                })
+            );
             client.request_shutdown();
             assert_eq!(stopped(&client).1, StopReason::Shutdown);
             done_tx.send(()).unwrap();
@@ -848,15 +866,19 @@ fn steel_ws_tcp_switch_keeps_history_gaps_and_ack_measurement_order() {
 fn lab_server_tcp_and_ws_contract() {
     for address in ["tcp://127.0.0.1:7240", "ws://127.0.0.1:7241/application/v1"] {
         let client = ready(address.parse().unwrap(), ClientOptions::default());
-        for (request, expected) in [
-            (Request::Ping, ResponseData::Ack),
-            (Request::Describe, ResponseData::Parameters(vec![])),
-        ] {
+        for request in [Request::Ping, Request::Describe] {
+            let describe = request == Request::Describe;
             let id = client.sender().request(request).unwrap();
-            assert_eq!(
-                event(&client),
-                ClientEvent::Response(Response { id, data: expected })
-            );
+            let ClientEvent::Response(response) = event(&client) else {
+                panic!()
+            };
+            assert_eq!(response.id, id);
+            if describe {
+                assert_eq!(response.data.parameters(), Some([].as_slice()));
+                assert_eq!(response.data.actions(), Some([].as_slice()));
+            } else {
+                assert_eq!(response.data, ResponseData::Ack);
+            }
         }
         client.request_shutdown();
         assert_eq!(stopped(&client).1, StopReason::Shutdown);

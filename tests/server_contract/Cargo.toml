@@ -1,0 +1,18 @@
+# Opt-in integration with the sibling lab-server checkout (tested at c973a02).
+# CARGO_TARGET_DIR must point at the existing shared build directory.
+# cargo test --manifest-path tests/server_contract/Cargo.toml
+# Only an in-memory driver is constructed; no serial port or startup config is used.
+[package]
+name = "lab-plot-server-contract"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+lab-plot = { path = "../.." }
+lab-server = { path = "../../../lab-server" }
+
+[lints.rust]
+unsafe_code = "forbid"
