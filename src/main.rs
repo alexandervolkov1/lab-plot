@@ -1,10 +1,12 @@
 use eframe::egui;
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints, Points};
 #[cfg(test)]
 use lab_plot::plots::{MAX_POINTS, PlotCommand};
 use lab_plot::{
     integration::{EVENTS_PER_FRAME, Integration, Phase},
-    plot_display::{format_x_mark, measurement_time, nearest_sample, sample_text, time_axis},
+    plot_display::{
+        format_x_mark, measurement_time, nearest_sample, sample_text, time_axis, time_grid_steps,
+    },
     plots::PlotState,
     steel_api::{register_lab_functions, register_plot_functions},
 };
@@ -74,28 +76,28 @@ impl LabPlot {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("REPL").clicked() {
-                    self.repl_visible = true;
-                }
-                if ui.button("Journal").clicked() {
-                    self.journal_visible = true;
-                }
-                ui.label(self.connection.phase().name());
-            });
+            main_menu(
+                ui,
+                self.connection.phase(),
+                &mut self.repl_visible,
+                &mut self.journal_visible,
+            );
             stream_warning(ui, &self.connection);
 
             let plot_id = ui.make_persistent_id("main_plot");
             let width = ui.available_width();
             let mut plot = Plot::new("main_plot")
                 .id(plot_id)
-                .legend(Legend::default())
+                .legend(Legend::default().position(Corner::LeftTop))
                 .label_formatter(|_| None);
             if time_axis(&self.plots) {
                 plot = plot
-                    .x_axis_formatter(move |mark, range| format_x_mark(mark, range, width))
+                    .x_grid_spacer(egui_plot::uniform_grid_spacer(time_grid_steps))
                     .custom_x_axes(vec![
-                        egui_plot::AxisHints::new_x().label_spacing(140.0..=180.0),
+                        // custom_x_axes replaces the axis, including its formatter.
+                        egui_plot::AxisHints::new_x()
+                            .formatter(move |mark, range| format_x_mark(mark, range, width))
+                            .label_spacing(100.0..=130.0),
                     ]);
             }
             let response = plot.show(ui, |plot_ui| {
@@ -206,6 +208,39 @@ impl LabPlot {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
     }
+}
+
+fn main_menu(ui: &mut egui::Ui, phase: Phase, repl_visible: &mut bool, journal_visible: &mut bool) {
+    ui.horizontal(|ui| {
+        let center_x = ui.available_rect_before_wrap().center().x;
+        if ui.button("REPL").clicked() {
+            *repl_visible = true;
+        }
+        if ui.button("Journal").clicked() {
+            *journal_visible = true;
+        }
+        let color = match phase {
+            Phase::Ready => egui::Color32::from_rgb(186, 230, 126),
+            Phase::Stopped => ui.visuals().error_fg_color,
+            Phase::Connecting | Phase::Stopping => ui.visuals().warn_fg_color,
+        };
+        let status = egui::RichText::new(phase.name().to_ascii_uppercase())
+            .color(color)
+            .strong();
+        let galley = egui::WidgetText::from(status).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        );
+        // Keep narrow windows from placing the centered status over the buttons.
+        let center_x = center_x.max(ui.next_widget_position().x + galley.size().x * 0.5);
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(center_x, ui.min_rect().center().y),
+            galley.size(),
+        );
+        ui.place(rect, egui::Label::new(galley));
+    });
 }
 
 fn stream_warning(ui: &mut egui::Ui, connection: &Integration) {
@@ -407,27 +442,31 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
-    fn painted_text(shape: &egui::epaint::Shape, text: &mut String) {
+    fn painted_labels(shape: &egui::epaint::Shape, labels: &mut Vec<egui::epaint::TextShape>) {
         match shape {
-            egui::epaint::Shape::Text(t) => {
-                text.push_str(&t.galley.job.text);
-                text.push('\n');
-            }
+            egui::epaint::Shape::Text(t) => labels.push(t.clone()),
             egui::epaint::Shape::Vec(shapes) => {
                 for shape in shapes {
-                    painted_text(shape, text);
+                    painted_labels(shape, labels);
                 }
             }
             _ => (),
         }
     }
 
-    fn draw_text(
+    fn draw_text(ctx: &egui::Context, size: [f32; 2], draw: impl FnMut(&mut egui::Ui)) -> String {
+        draw_labels(ctx, size, draw)
+            .iter()
+            .map(|t| format!("{}\n", t.galley.job.text))
+            .collect()
+    }
+
+    fn draw_labels(
         ctx: &egui::Context,
         size: [f32; 2],
         mut draw: impl FnMut(&mut egui::Ui),
-    ) -> String {
-        let mut text = String::new();
+    ) -> Vec<egui::epaint::TextShape> {
+        let mut labels = Vec::new();
         for _ in 0..2 {
             // A second frame settles scroll area layout.
             let input = egui::RawInput {
@@ -435,13 +474,66 @@ mod tests {
                 ..Default::default()
             };
             let output = ctx.run_ui(input, &mut draw);
-            text.clear();
+            labels.clear();
             for shape in &output.shapes {
-                painted_text(&shape.shape, &mut text);
+                painted_labels(&shape.shape, &mut labels);
             }
             output.drop_without_applying_deltas();
         }
-        text
+        labels
+    }
+
+    fn label_rect(label: &egui::epaint::TextShape) -> egui::Rect {
+        egui::Rect::from_min_size(label.pos, label.galley.size())
+    }
+
+    #[test]
+    fn menu_status_is_centered_colored_and_uses_normal_font_on_the_button_row() {
+        let ctx = egui::Context::default();
+        apply_mirage_theme(&ctx);
+        for width in [400.0, 900.0] {
+            for (phase, name, color) in [
+                (
+                    Phase::Ready,
+                    "READY",
+                    egui::Color32::from_rgb(186, 230, 126),
+                ),
+                (
+                    Phase::Stopped,
+                    "STOPPED",
+                    egui::Color32::from_rgb(242, 135, 121),
+                ),
+                (
+                    Phase::Connecting,
+                    "CONNECTING",
+                    egui::Color32::from_rgb(255, 204, 102),
+                ),
+                (
+                    Phase::Stopping,
+                    "STOPPING",
+                    egui::Color32::from_rgb(255, 204, 102),
+                ),
+            ] {
+                let labels = draw_labels(&ctx, [width, 600.0], |ui| {
+                    egui::CentralPanel::default()
+                        .show(ui, |ui| main_menu(ui, phase, &mut false, &mut false));
+                });
+                let status = labels.iter().find(|t| t.galley.job.text == name).unwrap();
+                assert!((label_rect(status).center().x - width * 0.5).abs() < 1.0);
+                for button in ["REPL", "Journal"] {
+                    let button = labels.iter().find(|t| t.galley.job.text == button).unwrap();
+                    assert!(
+                        (label_rect(status).center().y - label_rect(button).center().y).abs() < 1.0
+                    );
+                    assert!(!label_rect(status).intersects(label_rect(button)));
+                    assert_eq!(
+                        status.galley.job.sections[0].format.font_id.size,
+                        button.galley.job.sections[0].format.font_id.size
+                    );
+                }
+                assert_eq!(status.galley.job.sections[0].format.color, color);
+            }
+        }
     }
 
     fn journal_text(app: &mut LabPlot) -> String {
@@ -461,6 +553,176 @@ mod tests {
             }
             assert!(std::time::Instant::now() < deadline, "GUI update timed out");
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn server_measurements_render_time_ticks_on_the_actual_main_plot() {
+        use chrono::TimeZone;
+        use lab_plot::tcp_client::Request;
+        use serde_json::json;
+        use test_support::*;
+
+        let (address, server) = mock(move |mut socket| {
+            hello(&mut socket);
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":2,"op":"subscribe","keys":["temperature"]})
+            );
+            send(
+                &mut socket,
+                json!({"id":2,"status":"ok","keys":["temperature"]}),
+            );
+            for offset in [0, 30_000, 60_000] {
+                send(
+                    &mut socket,
+                    json!({"event":"measurement","status":"ok","key":"temperature","value":25.0,"unit":"degC","completed_at_unix_ms":1_794_565_335_123_u64 + offset}),
+                );
+            }
+            until_closed(&mut socket);
+        });
+        let ctx = egui::Context::default();
+        apply_mirage_theme(&ctx);
+        let mut plot_id = egui::Id::NULL;
+        draw_text(&ctx, [900.0, 600.0], |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                plot_id = ui.make_persistent_id("main_plot");
+            });
+        });
+        let mut app = LabPlot::new();
+        app.plots
+            .apply(PlotCommand::Add {
+                name: "Temperature".into(),
+                unit: "degC".into(),
+            })
+            .unwrap();
+        app.plots
+            .apply(PlotCommand::Bind {
+                name: "Temperature".into(),
+                key: "temperature".into(),
+            })
+            .unwrap();
+        let sender = app.connection.sender();
+        sender.connect(address).unwrap();
+        pump_app(&ctx, &mut app, |c| c.phase() == Phase::Ready);
+        sender
+            .request(Request::Subscribe {
+                keys: vec!["temperature".into()],
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + WAIT;
+        while app.plots.series["Temperature"].points.len() < 3 {
+            draw_text(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let text = draw_text(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
+        assert!(
+            text.lines()
+                .any(|line| chrono::NaiveTime::parse_from_str(line, "%H:%M:%S").is_ok()),
+            "no time ticks: {text}"
+        );
+        let midnight = chrono::Local
+            .with_ymd_and_hms(2026, 11, 13, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp() as f64;
+        for width in [400.0, 900.0] {
+            for (start, span, dated) in [
+                (midnight + 43_200.0, 60.0, false),
+                (midnight + 46_800.0, 3600.0, false),
+                (midnight + 50_400.0, 2.0, false),
+                (midnight + 50_400.0, 0.2, false),
+                (midnight - 30.0, 60.0, true),
+                (midnight - 86_400.0, 172_800.0, true),
+            ] {
+                // The same bounds memory is changed by egui_plot's pan/zoom controls.
+                let mut memory = egui_plot::PlotMemory::load(&ctx, plot_id).unwrap();
+                memory.auto_bounds = false.into();
+                memory.set_bounds(egui_plot::PlotBounds::from_min_max(
+                    [start, 20.0],
+                    [start + span, 30.0],
+                ));
+                memory.store(&ctx, plot_id);
+                let labels = draw_labels(&ctx, [width, 600.0], |ui| app.update_ui(ui));
+                let memory = egui_plot::PlotMemory::load(&ctx, plot_id).unwrap();
+                let frame = *memory.transform().frame();
+                let mut ticks: Vec<_> = labels
+                    .iter()
+                    .filter(|t| t.pos.y >= frame.bottom())
+                    .collect();
+                assert!(!ticks.is_empty(), "no ticks at width {width}, span {span}");
+                ticks.sort_by(|a, b| a.pos.x.total_cmp(&b.pos.x));
+                for tick in &ticks {
+                    let text = &tick.galley.job.text;
+                    let time = text.lines().last().unwrap();
+                    assert!(
+                        chrono::NaiveTime::parse_from_str(time, "%H:%M:%S%.f").is_ok(),
+                        "unexpected X label: {text}"
+                    );
+                    assert_eq!(text.lines().count(), if dated { 2 } else { 1 }, "{text}");
+                    if dated {
+                        assert!(
+                            chrono::NaiveDate::parse_from_str(
+                                text.lines().next().unwrap(),
+                                "%d.%m.%Y"
+                            )
+                            .is_ok()
+                        );
+                    }
+                    let rect = label_rect(tick);
+                    assert!(
+                        rect.left() >= frame.left() && rect.right() <= frame.right(),
+                        "clipped tick: {rect:?}, frame: {frame:?}"
+                    );
+                }
+                for pair in ticks.windows(2) {
+                    assert!(
+                        !label_rect(pair[0]).intersects(label_rect(pair[1])),
+                        "overlapping ticks"
+                    );
+                }
+                let legend = labels
+                    .iter()
+                    .find(|t| t.galley.job.text == "Temperature [degC]")
+                    .unwrap();
+                assert!(legend.pos.x < frame.center().x);
+                assert!((legend.pos.y - frame.top()).abs() < 40.0);
+            }
+        }
+        let sample = &app.plots.series["Temperature"].points[0];
+        assert_eq!(sample.xy, [1_794_565_335.123, 25.0]);
+        assert_eq!(
+            sample.measurement.as_ref().unwrap().completed_at_unix_ms,
+            1_794_565_335_123
+        );
+        sender.disconnect().unwrap();
+        pump_app(&ctx, &mut app, |c| c.phase() == Phase::Stopped);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn manual_points_keep_numeric_ticks_even_at_unix_sized_coordinates() {
+        for start in [0.0, 1_794_565_335.0] {
+            let ctx = egui::Context::default();
+            let mut app = LabPlot::new();
+            for offset in [0.0, 30.0, 60.0] {
+                app.plots
+                    .apply(PlotCommand::Point {
+                        name: "Manual".into(),
+                        time: start + offset,
+                        value: 25.0,
+                    })
+                    .unwrap();
+            }
+            let labels = draw_labels(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
+            let ticks: Vec<_> = labels.iter().filter(|t| t.pos.y > 570.0).collect();
+            assert!(!ticks.is_empty());
+            for tick in ticks {
+                let text = &tick.galley.job.text;
+                assert!(!text.contains(':'));
+                assert!(text.chars().any(|c| c.is_ascii_digit()));
+            }
         }
     }
 
@@ -800,7 +1062,7 @@ mod tests {
         ] {
             app.connection.stream_error = error.map(str::to_owned);
             let text = draw_text(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
-            for expected in ["REPL", "Journal", "Stopped"] {
+            for expected in ["REPL", "Journal", "STOPPED"] {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }
             for hidden in [

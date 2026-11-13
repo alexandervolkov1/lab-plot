@@ -5,7 +5,7 @@ use crate::{
 };
 use chrono::{DateTime, Local, Utc};
 use eframe::egui;
-use egui_plot::{GridMark, ItemId, ItemIdSet, PlotTransform};
+use egui_plot::{GridInput, GridMark, ItemId, ItemIdSet, PlotTransform};
 use std::ops::RangeInclusive;
 
 fn local_time(seconds: f64) -> Option<DateTime<Local>> {
@@ -29,6 +29,21 @@ pub fn measurement_time(ms: u64) -> Option<String> {
     )
 }
 
+pub fn time_grid_steps(input: GridInput) -> [f64; 3] {
+    // egui_plot's default minimum grid spacing is 8 points. Aim for time ticks
+    // about 160 points apart, including in narrow windows and while zooming.
+    let minimum = (input.base_step_size * (160.0 / 8.0)).max(0.001);
+    let step = [
+        0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0,
+        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0, 21600.0, 43200.0,
+        86400.0,
+    ]
+    .into_iter()
+    .find(|&step| step >= minimum)
+    .unwrap_or_else(|| 86400.0 * (minimum / 86400.0).ceil());
+    [step, step * 5.0, step * 10.0]
+}
+
 pub fn format_x_mark(mark: GridMark, range: &RangeInclusive<f64>, width: f32) -> String {
     let Some(time) = local_time(mark.value) else {
         return String::new();
@@ -36,17 +51,19 @@ pub fn format_x_mark(mark: GridMark, range: &RangeInclusive<f64>, width: f32) ->
     let across_days = local_time(*range.start())
         .zip(local_time(*range.end()))
         .is_none_or(|(a, b)| a.date_naive() != b.date_naive());
-    let format = if across_days {
-        "%d.%m.%Y %H:%M"
-    } else if mark.step_size < 1.0 {
+    let format = if mark.step_size < 1.0 || time.timestamp_subsec_millis() != 0 {
         "%H:%M:%S%.3f"
     } else {
         "%H:%M:%S"
     };
-    let label = time.format(format).to_string();
-    let margin = (range.end() - range.start()).abs() * (label.len() as f64 * 3.5 + 8.0)
+    let mut label = time.format(format).to_string();
+    if across_days {
+        label = format!("{}\n{label}", time.format("%d.%m.%Y"));
+    }
+    let longest_line = label.lines().map(str::len).max().unwrap_or(0);
+    let margin = (range.end() - range.start()).abs() * (longest_line as f64 * 3.5 + 8.0)
         / f64::from(width.max(1.0));
-    if mark.value < range.start() + margin {
+    if mark.value < range.start() + margin || mark.value > range.end() - margin {
         String::new()
     } else {
         label
@@ -144,6 +161,24 @@ mod tests {
             format_x_mark(mark, &(mark.value - 100.0..=mark.value + 100.0), 800.0).len(),
             8
         );
+        let fractional = GridMark {
+            value: mark.value + 0.5,
+            step_size: 2.5,
+        };
+        assert!(
+            format_x_mark(fractional, &(mark.value - 10.0..=mark.value + 10.0), 800.0)
+                .ends_with(".500")
+        );
+        let dated = format_x_mark(mark, &(mark.value - 86400.0..=mark.value + 86400.0), 800.0);
+        assert!(
+            dated.ends_with(
+                &local_time(mark.value)
+                    .unwrap()
+                    .format("%H:%M:%S")
+                    .to_string()
+            )
+        );
+        assert_eq!(dated.lines().count(), 2);
     }
     #[test]
     fn tooltip_preserves_integer_and_rejects_invalid_and_boolean_samples() {
