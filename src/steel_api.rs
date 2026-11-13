@@ -11,7 +11,7 @@
 //! (lab/subscribe! '("heater_temperature" "sample_temperature"))
 //! (lab/get "heater_temperature")
 //! (lab/set! "power" 20) ; Integer, unlike 20.0 (Float)
-//! (lab/describe) ; Parameters and available actions appear in the GUI journal
+//! (lab/describe) ; Structured association lists of parameters and actions
 //! (lab/invoke-action! "furnace1/apply")
 //! ```
 //! `lab/connect!` also accepts `tcp://127.0.0.1:7240`,
@@ -27,7 +27,17 @@
 //! Rust callers can add private trust anchors via `WebSocketOptions::trust_certificate`.
 //! The Steel interface has no certificate-verification bypass or custom CA setting.
 //!
-//! Network commands return positive request IDs, scoped to the connection.
+//! Network commands wait on the Steel thread for confirmed results; GUI stays live.
+//! get returns Integer/Float/Boolean or the empty list () for no_data. Read/server
+//! errors raise Steel errors. set!/invoke-action! return #true only after ACK.
+//! subscribe!/unsubscribe! return the confirmed full list of keys.
+//! describe returns (("parameters" (record ...)) ("actions" (record ...))), where each
+//! record is an association list with string keys, e.g. ("key" "furnace1/power").
+//! Optional fields are (). Integer metadata and values never pass through f64.
+//! connect!/disconnect! still return #true on command admission, not completion.
+//! Observe lab/status for Ready/Stopped. No extra connection or automatic retry.
+//! The delivery deadline is 2 * client request timeout + 5 s (35 s by default).
+//! On expiry, mutations raise OutcomeUnknown, reads raise ResponseUnavailable.
 //! The GUI retains the last 200 results/errors and counts evicted entries.
 //! `outcome_unknown`/`OutcomeUnknown` must never be interpreted as non-execution.
 //! `(lab/set! "enabled" #t)` / `#f` send Boolean without numeric conversion.
@@ -45,7 +55,9 @@
 use crate::{
     integration::ControlSender,
     plots::PlotCommand,
-    tcp_client::{Endpoint, Request, ScalarValue},
+    tcp_client::{
+        Endpoint, Number, Parameter, Reading, Request, ResponseData, ScalarType, ScalarValue,
+    },
 };
 use steel::{
     SteelVal,
@@ -83,12 +95,111 @@ pub fn set_value(value: &SteelVal) -> Result<ScalarValue, String> {
     }
 }
 
-// Steel 0.8.3's IntoSteelVal for u64 uses `as isize`; preserve the full TCP ID.
-fn request_id(id: u64) -> SteelVal {
+// Steel 0.8.3 casts u64 to isize; preserve the full metadata range.
+fn unsigned_integer(id: u64) -> SteelVal {
     match isize::try_from(id) {
         Ok(id) => SteelVal::IntV(id),
         Err(_) => SteelVal::BigNum(steel::gc::Gc::new(id.into())),
     }
+}
+
+fn list(values: impl IntoIterator<Item = SteelVal>) -> SteelVal {
+    SteelVal::ListV(values.into_iter().collect())
+}
+fn absent() -> SteelVal {
+    list([])
+}
+fn string(value: impl Into<String>) -> SteelVal {
+    SteelVal::StringV(value.into().into())
+}
+fn record(values: impl IntoIterator<Item = (&'static str, SteelVal)>) -> SteelVal {
+    list(
+        values
+            .into_iter()
+            .map(|(key, value)| list([string(key), value])),
+    )
+}
+fn scalar(value: ScalarValue) -> SteelVal {
+    match value {
+        ScalarValue::Integer(v) => match isize::try_from(v) {
+            Ok(v) => SteelVal::IntV(v),
+            Err(_) => SteelVal::BigNum(steel::gc::Gc::new(v.into())),
+        },
+        ScalarValue::Float(v) => SteelVal::NumV(v),
+        ScalarValue::Boolean(v) => SteelVal::BoolV(v),
+    }
+}
+fn bound(value: Option<Number>) -> SteelVal {
+    value.map_or_else(absent, |v| {
+        scalar(match v {
+            Number::Integer(v) => ScalarValue::Integer(v),
+            Number::Float(v) => ScalarValue::Float(v),
+        })
+    })
+}
+fn parameter(p: Parameter) -> SteelVal {
+    record([
+        ("key", string(p.key)),
+        (
+            "type",
+            string(match p.value_type {
+                ScalarType::Integer => "Integer",
+                ScalarType::Float => "Float",
+                ScalarType::Boolean => "Boolean",
+            }),
+        ),
+        ("min", bound(p.min)),
+        ("max", bound(p.max)),
+        ("unit", string(p.unit)),
+        ("writable", SteelVal::BoolV(p.writable)),
+        (
+            "poll_period_ns",
+            p.poll_period_ns.map_or_else(absent, unsigned_integer),
+        ),
+    ])
+}
+fn response_value(data: ResponseData) -> Result<SteelVal, String> {
+    Ok(match data {
+        ResponseData::Ack => SteelVal::BoolV(true),
+        ResponseData::NoData { .. } => absent(),
+        ResponseData::Measurement(m) => match m.reading {
+            Reading::Value { value, .. } => scalar(value),
+            Reading::Error(e) => {
+                return Err(format!(
+                    "Read error for {} at {}: {e}",
+                    m.key, m.completed_at_unix_ms
+                ));
+            }
+        },
+        ResponseData::Error(e) => {
+            return Err(format!(
+                "Server error{}: {}",
+                e.key.map(|k| format!(" for {k}")).unwrap_or_default(),
+                e.error
+            ));
+        }
+        ResponseData::Subscriptions(keys) => list(keys.into_iter().map(string)),
+        ResponseData::Parameters(parameters) => record([
+            ("parameters", list(parameters.into_iter().map(parameter))),
+            ("actions", absent()),
+        ]),
+        ResponseData::Description {
+            parameters,
+            actions,
+        } => record([
+            ("parameters", list(parameters.into_iter().map(parameter))),
+            (
+                "actions",
+                list(actions.into_iter().map(|a| {
+                    record([
+                        ("key", string(a.key)),
+                        ("description", string(a.description)),
+                    ])
+                })),
+            ),
+        ]),
+        ResponseData::Hello { .. } => return Err("Unexpected hello result".into()),
+    })
 }
 
 pub fn register_plot_functions(engine: &mut Engine, sender: ControlSender) {
@@ -170,33 +281,37 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
     engine.register_fn("lab/status", move || tx.status().name().to_owned());
     let tx = sender.clone();
     engine.register_fn("lab/subscribe!", move |keys: Vec<String>| {
-        tx.request(Request::Subscribe { keys }).map(request_id)
+        tx.request_wait(Request::Subscribe { keys })
+            .and_then(response_value)
     });
     let tx = sender.clone();
     engine.register_fn("lab/unsubscribe!", move |keys: Vec<String>| {
-        tx.request(Request::Unsubscribe { keys }).map(request_id)
+        tx.request_wait(Request::Unsubscribe { keys })
+            .and_then(response_value)
     });
     let tx = sender.clone();
     engine.register_fn("lab/get", move |key: String| {
-        tx.request(Request::Get { key }).map(request_id)
+        tx.request_wait(Request::Get { key })
+            .and_then(response_value)
     });
     let tx = sender.clone();
     engine.register_fn("lab/describe", move || {
-        tx.request(Request::Describe).map(request_id)
+        tx.request_wait(Request::Describe).and_then(response_value)
     });
     let tx = sender.clone();
     engine.register_fn("lab/invoke-action!", move |key: String| {
-        tx.request(Request::InvokeAction { key }).map(request_id)
+        tx.request_wait(Request::InvokeAction { key })
+            .and_then(response_value)
     });
     engine.register_fn(
         "lab/set!",
         move |key: String, value: SteelVal| -> Result<SteelVal, String> {
             sender
-                .request(Request::Set {
+                .request_wait(Request::Set {
                     key,
                     value: set_value(&value)?,
                 })
-                .map(request_id)
+                .and_then(response_value)
         },
     );
 }
@@ -205,9 +320,9 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
 mod tests {
     use super::*;
     #[test]
-    fn tcp_ids_remain_positive_and_exact_across_machine_integer_boundary() {
+    fn unsigned_metadata_remains_exact_across_machine_integer_boundary() {
         for id in [1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
-            assert_eq!(request_id(id).to_string(), id.to_string());
+            assert_eq!(unsigned_integer(id).to_string(), id.to_string());
         }
     }
 }

@@ -6,7 +6,8 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, mpsc},
+    time::Duration,
 };
 
 pub const CONTROL_CAPACITY: usize = 256;
@@ -40,6 +41,23 @@ struct Bridge {
     phase: Phase,
     sender: Option<ClientSender>,
     closing: bool,
+    connection: u64,
+    wait_timeout: Duration,
+    waiting: BTreeMap<(u64, u64), Awaiting>,
+}
+struct Awaiting {
+    reply: mpsc::SyncSender<Result<ResponseData, String>>,
+    mutation: bool,
+}
+impl Awaiting {
+    fn unavailable(&self, reason: &str) -> String {
+        let failure = if self.mutation {
+            "OutcomeUnknown"
+        } else {
+            "ResponseUnavailable"
+        };
+        format!("{failure}: {reason}; no automatic retry")
+    }
 }
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|e| e.into_inner())
@@ -105,6 +123,63 @@ impl ControlSender {
             .ok_or("Connection unavailable")?
             .request(request)
             .map_err(|e| format!("Request not accepted: {e:?}"))
+    }
+
+    /// Called on the Steel worker, never on the eframe thread. Admission and
+    /// waiter insertion share update's lock: even an immediate reply cannot race.
+    /// The bounded wait below holds no mutex and does no network I/O.
+    pub fn request_wait(&self, request: Request) -> Result<ResponseData, String> {
+        let mutation = matches!(request, Request::Set { .. } | Request::InvokeAction { .. });
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (key, timeout) = {
+            let mut bridge = lock(&self.shared);
+            if bridge.closing || bridge.phase != Phase::Ready {
+                return Err("NotSent: connection is not Ready".into());
+            }
+            if bridge.waiting.len() >= CONTROL_CAPACITY {
+                return Err("NotSent: response waiter capacity exceeded".into());
+            }
+            let id = bridge
+                .sender
+                .as_ref()
+                .ok_or("NotSent: connection unavailable")?
+                .request(request)
+                .map_err(|e| format!("NotSent: request not accepted: {e:?}"))?;
+            let key = (bridge.connection, id);
+            bridge.waiting.insert(
+                key,
+                Awaiting {
+                    reply: tx,
+                    mutation,
+                },
+            );
+            (key, bridge.wait_timeout)
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => {
+                let waiter = lock(&self.shared).waiting.remove(&key);
+                // A reply may have won the race with the timeout. It was sent
+                // under the same lock before removing the waiter.
+                if let Ok(result) = rx.try_recv() {
+                    return result;
+                }
+                let reason = "response delivery deadline expired or application closed";
+                Err(waiter.map_or_else(
+                    || {
+                        format!(
+                            "{}: {reason}",
+                            if mutation {
+                                "OutcomeUnknown"
+                            } else {
+                                "ResponseUnavailable"
+                            }
+                        )
+                    },
+                    |w| w.unavailable(reason),
+                ))
+            }
+        }
     }
 }
 
@@ -176,6 +251,12 @@ impl Integration {
                 phase: Phase::Stopped,
                 sender: None,
                 closing: false,
+                connection: 0,
+                wait_timeout: options
+                    .request_timeout
+                    .saturating_mul(2)
+                    .saturating_add(Duration::from_secs(5)),
+                waiting: BTreeMap::new(),
             })),
             client: None,
             options,
@@ -255,6 +336,7 @@ impl Integration {
                 }
                 Control::Connect(address) => {
                     self.connection += 1;
+                    bridge.connection = self.connection;
                     self.reason = None;
                     self.stream_error = None;
                     self.subscriptions.clear();
@@ -352,6 +434,9 @@ impl Integration {
                     }
                 }
                 ClientEvent::Response(response) => {
+                    if let Some(waiter) = bridge.waiting.remove(&(self.connection, response.id)) {
+                        let _ = waiter.reply.try_send(Ok(response.data.clone()));
+                    }
                     if let ResponseData::Subscriptions(keys) = &response.data {
                         let next: BTreeSet<_> = keys.iter().cloned().collect();
                         for removed in self.subscriptions.difference(&next) {
@@ -364,6 +449,12 @@ impl Integration {
                     self.record(JournalResult::Response(response));
                 }
                 ClientEvent::RequestFailed { id, failure } => {
+                    if let Some(waiter) = bridge.waiting.remove(&(self.connection, id)) {
+                        let _ = waiter.reply.try_send(Err(format!(
+                            "{failure:?}: connection {}; request {id}",
+                            self.connection
+                        )));
+                    }
                     self.record(JournalResult::RequestFailed { id, failure })
                 }
                 ClientEvent::ServerError(error) => {
@@ -378,6 +469,11 @@ impl Integration {
                     self.record(JournalResult::ServerError(error));
                 }
                 ClientEvent::Stopped(reason) => {
+                    for (_, waiter) in std::mem::take(&mut bridge.waiting) {
+                        let _ = waiter
+                            .reply
+                            .try_send(Err(waiter.unavailable("connection stopped")));
+                    }
                     self.reason = Some(format!("{reason:?}"));
                     self.record(JournalResult::Message(format!("Stopped: {reason:?}")));
                     self.terminal_received = true;
@@ -394,5 +490,131 @@ impl Integration {
             bridge.phase = Phase::Stopped;
         }
         count
+    }
+}
+
+impl Drop for Integration {
+    fn drop(&mut self) {
+        let mut bridge = lock(&self.shared);
+        bridge.closing = true;
+        bridge.sender = None;
+        for (_, waiter) in std::mem::take(&mut bridge.waiting) {
+            let _ = waiter
+                .reply
+                .try_send(Err(waiter.unavailable("application closed")));
+        }
+        // Release bridge before Client's bounded shutdown/join.
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread, time::Instant};
+    use test_support::*;
+
+    fn until(c: &mut Integration, p: &mut PlotState, condition: impl Fn(&Integration) -> bool) {
+        let start = Instant::now();
+        loop {
+            c.update(p);
+            if condition(c) {
+                return;
+            }
+            assert!(start.elapsed() < WAIT);
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn waiting_queued_mutation_is_not_sent_and_inflight_mutation_is_unknown() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (address, server) = mock(move |mut s| {
+            hello(&mut s);
+            read(&mut s);
+            seen_tx.send(()).unwrap();
+            until_closed(&mut s);
+        });
+        let mut c = Integration::new(ClientOptions {
+            pending_capacity: 1,
+            ..Default::default()
+        });
+        let mut p = PlotState::default();
+        c.sender().connect(address).unwrap();
+        until(&mut c, &mut p, |c| c.phase() == Phase::Ready);
+        let tx = c.sender();
+        let first =
+            thread::spawn(move || tx.request_wait(Request::InvokeAction { key: "a".into() }));
+        seen_rx.recv_timeout(WAIT).unwrap();
+        let tx = c.sender();
+        let second =
+            thread::spawn(move || tx.request_wait(Request::InvokeAction { key: "b".into() }));
+        until(&mut c, &mut p, |c| lock(&c.shared).waiting.len() == 2);
+        c.begin_close();
+        until(&mut c, &mut p, Integration::is_closed);
+        assert!(
+            first
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("OutcomeUnknown")
+        );
+        assert!(second.join().unwrap().unwrap_err().contains("NotSent"));
+        server.join().unwrap();
+    }
+    #[test]
+    fn delivery_timeout_without_gui_pumping_removes_waiter_and_preserves_uncertainty() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (address, server) = mock(move |mut s| {
+            hello(&mut s);
+            read(&mut s);
+            seen_tx.send(()).unwrap();
+            until_closed(&mut s);
+        });
+        let mut c = Integration::default();
+        let mut p = PlotState::default();
+        c.sender().connect(address).unwrap();
+        until(&mut c, &mut p, |c| c.phase() == Phase::Ready);
+        lock(&c.shared).wait_timeout = Duration::from_millis(100);
+        let tx = c.sender();
+        let task = thread::spawn(move || {
+            tx.request_wait(Request::Set {
+                key: "a".into(),
+                value: ScalarValue::Integer(1),
+            })
+        });
+        seen_rx.recv_timeout(WAIT).unwrap();
+        assert!(task.join().unwrap().unwrap_err().contains("OutcomeUnknown"));
+        assert!(lock(&c.shared).waiting.is_empty());
+        c.begin_close();
+        until(&mut c, &mut p, Integration::is_closed);
+        server.join().unwrap();
+    }
+    #[test]
+    fn dropping_integration_wakes_waiters_without_gui_delivery() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (address, server) = mock(move |mut s| {
+            hello(&mut s);
+            read(&mut s);
+            seen_tx.send(()).unwrap();
+            until_closed(&mut s);
+        });
+        let mut c = Integration::default();
+        let mut p = PlotState::default();
+        c.sender().connect(address).unwrap();
+        until(&mut c, &mut p, |c| c.phase() == Phase::Ready);
+        let tx = c.sender();
+        let task = thread::spawn(move || tx.request_wait(Request::Get { key: "a".into() }));
+        seen_rx.recv_timeout(WAIT).unwrap();
+        drop(c);
+        assert!(
+            task.join()
+                .unwrap()
+                .unwrap_err()
+                .contains("ResponseUnavailable")
+        );
+        server.join().unwrap();
     }
 }

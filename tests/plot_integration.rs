@@ -67,7 +67,10 @@ fn has_result(connection: &Integration, id: u64) -> bool {
 }
 
 #[test]
-fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_reconnect() {
+fn admitted_describe_and_actions_are_journaled_once_and_not_replayed_on_reconnect() {
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let steel = SteelThread::new(connection.sender());
     let (gate_tx, gate_rx) = mpsc::channel();
     let (seen_tx, seen_rx) = mpsc::channel();
     let (address, server) = mock(move |mut socket| {
@@ -102,9 +105,6 @@ fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_recon
         );
         // Drop the connection after receiving an action, without an ACK.
     });
-    let mut connection = Integration::default();
-    let mut plots = PlotState::default();
-    let steel = SteelThread::new(connection.sender());
     for source in ["(lab/describe)", r#"(lab/invoke-action! "furnace1/apply")"#] {
         assert!(steel.eval(source).is_err());
     }
@@ -129,7 +129,18 @@ fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_recon
             ))
             .is_err()
     );
-    assert_eq!(steel.eval(r#"(lab/describe) (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply") (lab/invoke-action! "furnace1/apply")"#).unwrap(), vec!["2","3","4","5","6"]);
+    let sender = connection.sender();
+    assert_eq!(sender.request(Request::Describe).unwrap(), 2);
+    for id in 3..=6 {
+        assert_eq!(
+            sender
+                .request(Request::InvokeAction {
+                    key: "furnace1/apply".into()
+                })
+                .unwrap(),
+            id
+        );
+    }
     seen_rx.recv_timeout(WAIT).unwrap();
     assert_eq!(steel.eval("(+ 20 22)").unwrap(), vec!["42"]);
     connection.update(&mut plots);
@@ -153,10 +164,12 @@ fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_recon
         assert!(entries[0].text().contains(text));
     }
     assert_eq!(
-        steel
-            .eval(r#"(lab/invoke-action! "furnace1/apply")"#)
+        sender
+            .request(Request::InvokeAction {
+                key: "furnace1/apply".into()
+            })
             .unwrap(),
-        vec!["7"]
+        7
     );
     pump(&mut connection, &mut plots, |c, _| {
         c.phase() == Phase::Stopped
@@ -184,10 +197,8 @@ fn steel_describe_and_actions_are_async_journaled_once_and_not_replayed_on_recon
     pump(&mut connection, &mut plots, |c, _| {
         c.phase() == Phase::Ready
     });
-    assert_eq!(
-        steel.eval(r#"(lab/describe) (lab/get "p")"#).unwrap(),
-        vec!["2", "3"]
-    );
+    assert_eq!(sender.request(Request::Describe).unwrap(), 2);
+    assert_eq!(sender.request(Request::Get { key: "p".into() }).unwrap(), 3);
     pump(&mut connection, &mut plots, |c, _| {
         c.journal
             .iter()
@@ -212,8 +223,9 @@ fn observation(key: &str, value: serde_json::Value, time: u64) -> serde_json::Va
     json!({"event":"measurement","status":"ok","key":key,"value":value,"unit":"","completed_at_unix_ms":time})
 }
 
-// Evaluate on a real separate Engine thread. A withheld server ACK cannot be
-// released until eval returns, so the async assertions don't rely on timing.
+// Evaluate validation and plot commands on a real separate Engine thread.
+// Raw request admission below exercises delayed/out-of-order journal delivery;
+// confirmed Steel results are tested in steel_results.rs.
 type EvalReply = mpsc::SyncSender<Result<Vec<String>, String>>;
 struct SteelThread {
     tx: mpsc::SyncSender<(String, EvalReply)>,
@@ -222,10 +234,12 @@ struct SteelThread {
 impl SteelThread {
     fn new(sender: ControlSender) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(String, EvalReply)>(1);
+        let (ready_tx, ready_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let mut engine = Engine::new();
             register_plot_functions(&mut engine, sender.clone());
             register_lab_functions(&mut engine, sender);
+            ready_tx.send(()).unwrap();
             while let Ok((source, reply)) = rx.recv() {
                 let result = engine
                     .compile_and_run_raw_program(source)
@@ -234,6 +248,7 @@ impl SteelThread {
                 reply.send(result).unwrap();
             }
         });
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
         Self {
             tx,
             handle: Some(handle),
@@ -442,6 +457,9 @@ fn gui_command_errors_and_journal_eviction_are_visible_and_bounded() {
 
 #[test]
 fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let steel = SteelThread::new(connection.sender());
     let (gate_tx, gate_rx) = mpsc::sync_channel(1);
     let (seen_tx, seen_rx) = mpsc::sync_channel(1);
     let (address, server) = mock(move |mut socket| {
@@ -502,9 +520,6 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
         );
         until_closed(&mut socket); // includes proof that outcome_unknown was not retried
     });
-    let mut connection = Integration::default();
-    let mut plots = PlotState::default();
-    let steel = SteelThread::new(connection.sender());
     assert_eq!(
         steel
             .eval(&format!("(lab/connect! \"{address}\")"))
@@ -523,8 +538,13 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
     assert_eq!(steel.eval("(lab/status)").unwrap(), vec!["\"Ready\""]);
     steel.eval("(plot/add! \"A\" \"degC\") (plot/add! \"B\" \"degC\") (plot/add! \"Copy\" \"degC\") (plot/bind! \"A\" \"a\") (plot/bind! \"B\" \"b\") (plot/bind! \"Copy\" \"a\")").unwrap();
     assert_eq!(
-        steel.eval("(lab/subscribe! '(\"a\" \"b\"))").unwrap(),
-        vec!["2"]
+        connection
+            .sender()
+            .request(Request::Subscribe {
+                keys: vec!["a".into(), "b".into()]
+            })
+            .unwrap(),
+        2
     );
     seen_rx.recv_timeout(WAIT).unwrap();
     connection.update(&mut plots);
@@ -540,12 +560,25 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
             .eval("(lab/set! \"power\" 9223372036854775808)")
             .is_err()
     );
-    assert_eq!(
-        steel
-            .eval("(lab/get \"a\") (lab/set! \"power\" 20) (lab/set! \"reference\" 20.0)")
-            .unwrap(),
-        vec!["3", "4", "5"]
-    );
+    for (id, request) in [
+        (3, Request::Get { key: "a".into() }),
+        (
+            4,
+            Request::Set {
+                key: "power".into(),
+                value: ScalarValue::Integer(20),
+            },
+        ),
+        (
+            5,
+            Request::Set {
+                key: "reference".into(),
+                value: ScalarValue::Float(20.0),
+            },
+        ),
+    ] {
+        assert_eq!(connection.sender().request(request).unwrap(), id);
+    }
     assert_eq!(steel.eval("(+ 1 2)").unwrap(), vec!["3"]);
     seen_rx.recv_timeout(WAIT).unwrap();
     gate_tx.send(()).unwrap();
@@ -564,8 +597,13 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
     );
     assert_eq!(plots.series["A"].points.len(), 1); // get results are not streamed points
     assert_eq!(
-        steel.eval("(lab/unsubscribe! '(\"a\"))").unwrap(),
-        vec!["6"]
+        connection
+            .sender()
+            .request(Request::Unsubscribe {
+                keys: vec!["a".into()]
+            })
+            .unwrap(),
+        6
     );
     seen_rx.recv_timeout(WAIT).unwrap();
     pump(&mut connection, &mut plots, |_, p| {
@@ -581,7 +619,15 @@ fn steel_controls_one_socket_async_requests_types_bindings_and_subscriptions() {
         .unwrap();
     connection.update(&mut plots);
     assert!(connection.subscriptions.contains("b"));
-    assert_eq!(steel.eval("(lab/subscribe! '(\"a\"))").unwrap(), vec!["7"]);
+    assert_eq!(
+        connection
+            .sender()
+            .request(Request::Subscribe {
+                keys: vec!["a".into()]
+            })
+            .unwrap(),
+        7
+    );
     pump(&mut connection, &mut plots, |_, p| {
         p.series["A"].points.len() == 3
     });
@@ -971,7 +1017,10 @@ fn event_overflow_is_reported_even_before_gui_drains_events() {
 }
 
 #[test]
-fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
+fn mixed_scalar_requests_and_steel_plot_controls_share_one_socket() {
+    let mut connection = Integration::default();
+    let mut plots = PlotState::default();
+    let steel = SteelThread::new(connection.sender());
     let (gate_tx, gate_rx) = mpsc::sync_channel(1);
     let (seen_tx, seen_rx) = mpsc::sync_channel(1);
     let (address, server) = mock(move |mut socket| {
@@ -1027,7 +1076,7 @@ fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
             json!({"id":10,"op":"get","key":"enabled"})
         );
         seen_tx.send(()).unwrap();
-        // No response is released until all Steel calls have returned their IDs.
+        // No response is released until all requests have been admitted.
         gate_rx.recv_timeout(WAIT).unwrap();
         send(
             &mut socket,
@@ -1042,9 +1091,6 @@ fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
         );
         until_closed(&mut socket); // Any retry, including Boolean set, fails the test.
     });
-    let mut connection = Integration::default();
-    let mut plots = PlotState::default();
-    let steel = SteelThread::new(connection.sender());
     steel
         .eval(&format!("(lab/connect! \"{address}\")"))
         .unwrap();
@@ -1053,10 +1099,15 @@ fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
     });
     steel.eval(r#"(plot/add! "Integer" "") (plot/bind! "Integer" "integer") (plot/add! "Float" "") (plot/bind! "Float" "float") (plot/add! "Wrong" "") (plot/point! "Wrong" 0.0 42.0) (plot/bind! "Wrong" "enabled")"#).unwrap();
     assert_eq!(
-        steel
-            .eval(r#"(lab/subscribe! '("integer" "float" "enabled" "fault"))"#)
+        connection
+            .sender()
+            .request(Request::Subscribe {
+                keys: ["integer", "float", "enabled", "fault"]
+                    .map(str::to_owned)
+                    .to_vec()
+            })
             .unwrap(),
-        vec!["2"]
+        2
     );
     pump(&mut connection, &mut plots, |c, p| {
         c.boolean_signals.len() == 2 && p.series["Float"].points.len() == 1
@@ -1112,7 +1163,32 @@ fn boolean_steel_literals_variables_and_mixed_subscription_share_one_socket() {
         assert!(steel.eval(expression).is_err());
     }
     steel.eval(r#"(define enabled "enabled")"#).unwrap();
-    assert_eq!(steel.eval(r#"(lab/set! "enabled" #t) (lab/set! "enabled" #f) (lab/set! enabled #t) (lab/set! enabled #f) (lab/set! "power" 20) (lab/set! "reference" 20.0) (lab/set! "exact" 9007199254740993) (lab/get enabled)"#).unwrap(), vec!["3","4","5","6","7","8","9","10"]);
+    for (key, value) in [
+        ("enabled", ScalarValue::Boolean(true)),
+        ("enabled", ScalarValue::Boolean(false)),
+        ("enabled", ScalarValue::Boolean(true)),
+        ("enabled", ScalarValue::Boolean(false)),
+        ("power", ScalarValue::Integer(20)),
+        ("reference", ScalarValue::Float(20.0)),
+        ("exact", ScalarValue::Integer(9007199254740993)),
+    ] {
+        connection
+            .sender()
+            .request(Request::Set {
+                key: key.into(),
+                value,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        connection
+            .sender()
+            .request(Request::Get {
+                key: "enabled".into()
+            })
+            .unwrap(),
+        10
+    );
     assert_eq!(steel.eval("(+ 1 2)").unwrap(), vec!["3"]);
     seen_rx.recv_timeout(WAIT).unwrap();
     assert!(!has_result(&connection, 3));

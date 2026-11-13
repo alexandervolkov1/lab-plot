@@ -791,14 +791,23 @@ fn steel_ws_tcp_switch_keeps_history_gaps_and_ack_measurement_order() {
     }
     let mut integration = Integration::default();
     let mut plots = PlotState::default();
-    let mut steel = steel::steel_vm::engine::Engine::new();
-    register_lab_functions(&mut steel, integration.sender());
-    register_plot_functions(&mut steel, integration.sender());
-    steel
-        .compile_and_run_raw_program(
-            r#"(plot/add! "A" "V") (plot/add! "B" "V") (plot/bind! "A" "a") (plot/bind! "B" "b")"#,
-        )
-        .unwrap();
+    let sender = integration.sender();
+    let (eval_tx, eval_rx) = mpsc::channel::<String>();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let engine_task = thread::spawn(move || {
+        let mut steel = steel::steel_vm::engine::Engine::new();
+        register_lab_functions(&mut steel, sender.clone());
+        register_plot_functions(&mut steel, sender);
+        steel.compile_and_run_raw_program(r#"(plot/add! "A" "V") (plot/add! "B" "V") (plot/bind! "A" "a") (plot/bind! "B" "b")"#).unwrap();
+        reply_tx.send(Vec::<String>::new()).unwrap();
+        while let Ok(source) = eval_rx.recv() {
+            let values = steel.compile_and_run_raw_program(source).unwrap();
+            reply_tx
+                .send(values.into_iter().map(|v| v.to_string()).collect())
+                .unwrap();
+        }
+    });
+    reply_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     for (iteration, ws) in [true, false, true].into_iter().enumerate() {
         let (done_tx, done_rx) = mpsc::channel();
         let data = |key| json!({"event":"measurement","status":"ok","key":key,"value":1.5,"unit":"V","completed_at_unix_ms":10});
@@ -837,17 +846,17 @@ fn steel_ws_tcp_switch_keeps_history_gaps_and_ack_measurement_order() {
             c.phase() == Phase::Ready
         });
         assert!(integration.subscriptions.is_empty());
-        steel
-            .compile_and_run_raw_program("(lab/subscribe! '(\"a\" \"b\"))")
+        eval_tx
+            .send(r#"(lab/subscribe! '("a" "b"))"#.into())
             .unwrap();
         pump(&mut integration, &mut plots, |_, p| {
             p.series["A"].points.len() == iteration + 1
                 && p.series["B"].points.len() == iteration + 1
         });
         assert_eq!(plots.series["A"].segments().len(), iteration + 1);
-        steel
-            .compile_and_run_raw_program("(lab/disconnect!)")
-            .unwrap();
+        assert_eq!(reply_rx.recv_timeout(WAIT).unwrap(), vec!["(\"a\" \"b\")"]);
+        eval_tx.send("(lab/disconnect!)".into()).unwrap();
+        assert_eq!(reply_rx.recv_timeout(WAIT).unwrap(), vec!["#true"]);
         pump(&mut integration, &mut plots, |c, _| {
             c.phase() == Phase::Stopped
         });
@@ -856,6 +865,8 @@ fn steel_ws_tcp_switch_keeps_history_gaps_and_ack_measurement_order() {
         done_tx.send(()).unwrap();
         task.join().unwrap();
     }
+    drop(eval_tx);
+    engine_task.join().unwrap();
     integration.begin_close();
     assert!(integration.is_closed());
 }
