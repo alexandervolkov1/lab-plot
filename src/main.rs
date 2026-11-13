@@ -4,6 +4,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use lab_plot::plots::{MAX_POINTS, PlotCommand};
 use lab_plot::{
     integration::{EVENTS_PER_FRAME, Integration},
+    plot_display::{format_x_mark, nearest_sample, sample_text, time_axis},
     plots::PlotState,
     steel_api::{register_lab_functions, register_plot_functions},
 };
@@ -76,35 +77,79 @@ impl LabPlot {
             }
             connection_status(ui, &self.connection, &self.plots);
 
-            Plot::new("main_plot")
+            let plot_id = ui.make_persistent_id("main_plot");
+            let width = ui.available_width();
+            let mut plot = Plot::new("main_plot")
+                .id(plot_id)
                 .legend(Legend::default())
-                .show(ui, |plot_ui| {
-                    for (name, series) in &self.plots.series {
-                        if series.points.is_empty() {
-                            continue;
-                        }
+                .label_formatter(|_| None);
+            if time_axis(&self.plots) {
+                plot = plot
+                    .x_axis_formatter(move |mark, range| format_x_mark(mark, range, width))
+                    .custom_x_axes(vec![
+                        egui_plot::AxisHints::new_x().label_spacing(140.0..=180.0),
+                    ]);
+            }
+            let response = plot.show(ui, |plot_ui| {
+                for (name, series) in &self.plots.series {
+                    if series.points.is_empty() {
+                        continue;
+                    }
 
-                        for range in series.segments() {
-                            let unit = series.sample_unit(range.start);
-                            let label = if unit.is_empty() {
-                                name.clone()
-                            } else {
-                                format!("{name} [{unit}]")
-                            };
-                            let single = range.len() == 1;
-                            let id = (name, range.start);
-                            let points: PlotPoints = range.map(|i| series.points[i].xy).collect();
-                            let color = series_color(series.color_index);
-                            if single {
-                                plot_ui.points(
-                                    Points::new(label, points).id(id).color(color).radius(2.0),
-                                );
-                            } else {
-                                plot_ui.line(Line::new(label, points).id(id).color(color));
-                            }
+                    for range in series.segments() {
+                        let unit = series.sample_unit(range.start);
+                        let label = if unit.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name} [{unit}]")
+                        };
+                        let single = range.len() == 1;
+                        let id = (name, unit);
+                        let points: PlotPoints = range.map(|i| series.points[i].xy).collect();
+                        let color = series_color(series.color_index);
+                        if single {
+                            plot_ui
+                                .points(Points::new(label, points).id(id).color(color).radius(2.0));
+                        } else {
+                            plot_ui.line(
+                                Line::new(label, points)
+                                    .id(id)
+                                    .color(color)
+                                    .allow_hover(false),
+                            );
                         }
                     }
-                });
+                }
+            });
+            if response.response.contains_pointer()
+                && !ui.input(|i| i.pointer.any_down())
+                && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
+                && response.transform.frame().contains(pointer)
+            {
+                let hidden = egui_plot::PlotMemory::load(ui.ctx(), plot_id)
+                    .map(|m| m.hidden_items)
+                    .unwrap_or_default();
+                if let Some((name, unit, sample)) =
+                    nearest_sample(&self.plots, &response.transform, pointer, &hidden, 12.0)
+                    && let Some(text) = sample_text(name, unit, sample)
+                {
+                    ui.painter().circle_stroke(
+                        response.transform.position_from_point(&sample.xy.into()),
+                        4.0,
+                        egui::Stroke::new(1.5, series_color(self.plots.series[name].color_index)),
+                    );
+                    egui::Tooltip::always_open(
+                        ui.ctx().clone(),
+                        response.response.layer_id,
+                        response.response.id,
+                        egui::PopupAnchor::Pointer,
+                    )
+                    .gap(12.0)
+                    .show(|ui| {
+                        ui.label(text);
+                    });
+                }
+            }
         });
 
         if self.repl_visible {

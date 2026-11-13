@@ -3154,6 +3154,7 @@ dependencies = [
 name = "lab-plot"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "egui_plot",
  "hickory-resolver",

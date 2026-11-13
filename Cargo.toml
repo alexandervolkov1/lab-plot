@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision", "raw_value"] }
 serde = "1.0"
 eframe = { version = "=0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
