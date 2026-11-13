@@ -193,6 +193,7 @@ pub enum JournalResult {
 #[derive(Debug)]
 pub struct JournalEntry {
     pub connection: u64,
+    pub received_at: std::time::SystemTime,
     pub result: JournalResult,
 }
 impl JournalEntry {
@@ -202,17 +203,6 @@ impl JournalEntry {
             JournalResult::RequestFailed { id, .. } => Some(*id),
             _ => None,
         }
-    }
-    pub fn text(&self) -> String {
-        let body = match &self.result {
-            JournalResult::Message(s) => s.clone(),
-            JournalResult::Response(r) => format!("request {}: {:?}", r.id, r.data),
-            JournalResult::RequestFailed { id, failure } => {
-                format!("request {id}: RequestFailed {failure:?}")
-            }
-            JournalResult::ServerError(e) => format!("ServerError: {} {:?}", e.error, e.key),
-        };
-        format!("Connection {} · {body}", self.connection)
     }
 }
 
@@ -286,6 +276,7 @@ impl Integration {
         }
         self.journal.push_back(JournalEntry {
             connection: self.connection,
+            received_at: std::time::SystemTime::now(),
             result,
         });
     }

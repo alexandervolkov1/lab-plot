@@ -150,7 +150,7 @@ fn admitted_describe_and_actions_are_journaled_once_and_not_replayed_on_reconnec
     pump(&mut connection, &mut plots, |c, _| has_result(c, 6));
     for (id, text) in [
         (2, "Apply staged configuration"),
-        (3, "Ack"),
+        (3, "ACK"),
         (4, "unknown_key"),
         (5, "runtime_timeout"),
         (6, "outcome_unknown"),
@@ -1206,7 +1206,7 @@ fn mixed_scalar_requests_and_steel_plot_controls_share_one_socket() {
         .iter()
         .find(|e| e.request_id() == Some(10))
         .unwrap();
-    assert!(get.text().contains("Boolean(false)"));
+    assert!(get.text().contains("value: false"));
     assert!(get.text().contains("5678"));
     let results: Vec<_> = connection
         .journal

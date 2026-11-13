@@ -30,6 +30,7 @@ fn series_color(index: usize) -> egui::Color32 {
 struct LabPlot {
     repl: repl::Repl,
     repl_visible: bool,
+    journal_visible: bool,
     connection: Integration,
     plots: PlotState,
 }
@@ -46,6 +47,7 @@ impl LabPlot {
         Self {
             repl,
             repl_visible: false,
+            journal_visible: false,
             connection,
             plots: PlotState::default(),
         }
@@ -72,9 +74,14 @@ impl LabPlot {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if ui.button("REPL").clicked() {
-                self.repl_visible = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Steel").clicked() {
+                    self.repl_visible = true;
+                }
+                if ui.button("Journal").clicked() {
+                    self.journal_visible = true;
+                }
+            });
             connection_status(ui, &self.connection, &self.plots);
 
             let plot_id = ui.make_persistent_id("main_plot");
@@ -174,6 +181,17 @@ impl LabPlot {
             );
         }
 
+        if self.journal_visible {
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("tcp_journal"),
+                egui::ViewportBuilder::default()
+                    .with_title("Journal - TCP / WebSocket")
+                    .with_inner_size([760.0, 560.0])
+                    .with_min_inner_size([400.0, 280.0]),
+                |ui, _class| journal_viewport_ui(ui, &self.connection, &mut self.journal_visible),
+            );
+        }
+
         if processed == EVENTS_PER_FRAME {
             ui.ctx().request_repaint();
         } else {
@@ -197,22 +215,69 @@ fn connection_status(ui: &mut egui::Ui, connection: &Integration, plots: &PlotSt
             format!("Stream stopped: {error}. Measurement continuity is not guaranteed."),
         );
     }
-    egui::CollapsingHeader::new("Server results and subscriptions").default_open(true).show(ui, |ui| {
-        ui.label(format!("Subscriptions: {}", connection.subscriptions.iter().cloned().collect::<Vec<_>>().join(", ")));
-        ui.label("Boolean signals");
-        if connection.boolean_signals.is_empty() { ui.weak("No current Boolean observations"); }
-        for (key, state) in &connection.boolean_signals {
-            ui.label(format!("{key}    {}    ({} Unix ms)", state.value, state.completed_at_unix_ms));
-        }
-        for (key, error) in &connection.signal_errors { ui.colored_label(ui.visuals().error_fg_color, format!("{key}: {error}")); }
-        for (name, series) in &plots.series {
-            if let Some(error) = &series.error { ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}")); }
-        }
-        ui.weak(format!("Last 200 results/errors; {} older entries evicted", connection.evicted));
-        ui.weak("Request ID = accepted, not executed. OutcomeUnknown / outcome_unknown = execution may have occurred; no automatic retry.");
-        egui::ScrollArea::vertical().id_salt("tcp_results").max_height(130.0).stick_to_bottom(true).show(ui, |ui| {
-            for entry in &connection.journal { ui.label(entry.text()); }
+    egui::CollapsingHeader::new("Subscriptions and signals")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(format!(
+                "Subscriptions: {}",
+                connection
+                    .subscriptions
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            ui.label("Boolean signals");
+            if connection.boolean_signals.is_empty() {
+                ui.weak("No current Boolean observations");
+            }
+            for (key, state) in &connection.boolean_signals {
+                ui.label(format!(
+                    "{key}    {}    ({} Unix ms)",
+                    state.value, state.completed_at_unix_ms
+                ));
+            }
+            for (key, error) in &connection.signal_errors {
+                ui.colored_label(ui.visuals().error_fg_color, format!("{key}: {error}"));
+            }
+            for (name, series) in &plots.series {
+                if let Some(error) = &series.error {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}"));
+                }
+            }
         });
+}
+
+fn journal_viewport_ui(ui: &mut egui::Ui, connection: &Integration, visible: &mut bool) {
+    if ui.input(|i| i.viewport().close_requested()) {
+        *visible = false;
+        return;
+    }
+    egui::CentralPanel::default().show(ui, |ui| {
+        ui.label(format!(
+            "Connection {}: {}",
+            connection.connection,
+            connection.phase().name()
+        ));
+        ui.weak(format!(
+            "Last {} entries; {} older entries evicted",
+            lab_plot::integration::JOURNAL_CAPACITY,
+            connection.evicted
+        ));
+        egui::ScrollArea::vertical()
+            .id_salt("tcp_results")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for entry in &connection.journal {
+                    let mut text = egui::RichText::new(entry.text()).monospace();
+                    if entry.is_error() {
+                        text = text.color(ui.visuals().error_fg_color);
+                    }
+                    ui.add(egui::Label::new(text).wrap().selectable(true));
+                    ui.separator();
+                }
+            });
     });
 }
 
@@ -295,6 +360,44 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_close_and_reopen_preserve_messages_and_connection() {
+        use lab_plot::integration::{JournalEntry, JournalResult};
+        let ctx = egui::Context::default();
+        let mut c = Integration::default();
+        let mut visible = true;
+        c.journal.push_back(JournalEntry {
+            connection: 1,
+            received_at: std::time::SystemTime::now(),
+            result: JournalResult::Message("retained message".into()),
+        });
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        ctx.run_ui(input, |ui| journal_viewport_ui(ui, &c, &mut visible))
+            .drop_without_applying_deltas();
+        assert!(!visible);
+        assert_eq!(c.journal.len(), 1);
+        assert!(!c.is_closed());
+        c.journal.push_back(JournalEntry {
+            connection: 1,
+            received_at: std::time::SystemTime::now(),
+            result: JournalResult::Message("arrived while hidden".into()),
+        });
+        visible = true;
+        ctx.run_ui(Default::default(), |ui| {
+            journal_viewport_ui(ui, &c, &mut visible)
+        })
+        .drop_without_applying_deltas();
+        assert!(visible);
+        assert_eq!(c.journal.len(), 2);
+        assert!(c.journal[0].text().contains("retained message"));
+    }
 
     #[test]
     fn gui_defers_window_close_until_client_has_finished() {
