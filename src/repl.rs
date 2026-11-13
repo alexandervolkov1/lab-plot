@@ -89,6 +89,7 @@ enum FileAction {
 
 pub struct Repl {
     script: ScriptFile,
+    script_visible: bool,
     input: String,
     history: VecDeque<String>,
     last_output: String,
@@ -141,6 +142,7 @@ impl Repl {
 
         Self {
             script: ScriptFile::default(),
+            script_visible: false,
             input: String::new(),
             history: VecDeque::new(),
             last_output: String::new(),
@@ -245,6 +247,7 @@ impl Repl {
         match action {
             FileAction::Close => self.close_allowed = true,
             FileAction::New => {
+                self.script_visible = true;
                 self.script = ScriptFile::default();
                 self.file_error = None;
                 self.script_format_message = None;
@@ -255,16 +258,21 @@ impl Repl {
                     .add_filter("Steel", &["scm", "ss"])
                     .pick_file()
                 {
-                    match self.script.open(&path) {
-                        Ok(()) => {
-                            self.file_error = None;
-                            self.script_format_message = None;
-                            self.reset_script_cursor = true;
-                        }
-                        Err(error) => self.file_error = Some(format!("Open: {error}")),
-                    }
+                    self.open_script(&path);
                 }
             }
+        }
+    }
+
+    fn open_script(&mut self, path: &std::path::Path) {
+        match self.script.open(path) {
+            Ok(()) => {
+                self.script_visible = true;
+                self.file_error = None;
+                self.script_format_message = None;
+                self.reset_script_cursor = true;
+            }
+            Err(error) => self.file_error = Some(format!("Open: {error}")),
         }
     }
 
@@ -456,6 +464,16 @@ impl Repl {
                     {
                         self.run_script();
                     }
+                    if ui
+                        .button(if self.script_visible {
+                            "Hide Script"
+                        } else {
+                            "Show Script"
+                        })
+                        .clicked()
+                    {
+                        self.script_visible = !self.script_visible;
+                    }
                 });
             },
         );
@@ -501,6 +519,10 @@ impl Repl {
         ui.add_enabled_ui(
             self.pending_action.is_none() && self.pending_save.is_none(),
             |ui| {
+                if !self.script_visible {
+                    self.repl_ui(ui);
+                    return;
+                }
                 let height = ui.available_height();
                 egui::Panel::bottom("steel_repl_panel")
                     .resizable(true)
@@ -747,9 +769,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collapse_preserves_editor_state_and_expands_lower_area_at_minimum_size() {
+        let ctx = egui::Context::default();
+        let mut repl = Repl::new(|_| {});
+        assert!(!repl.script_visible);
+        repl.script.text = "(+ 1 2)".into();
+        let id = egui::Id::unique("steel_script_editor");
+        let draw = |repl: &mut Repl| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(520.0, 440.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| repl.ui(ui),
+            )
+        };
+        repl.script_visible = true;
+        draw(&mut repl).drop_without_applying_deltas();
+        replace_editor_text(&ctx, id, &mut repl.script.text, "(+ 1 3)".into());
+        let before = egui::TextEdit::load_state(&ctx, id).unwrap();
+        repl.script_visible = false;
+        let output = draw(&mut repl);
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some((t.pos, t.galley.job.text.clone())),
+                _ => None,
+            })
+            .collect();
+        for label in [
+            "New",
+            "Open",
+            "Save",
+            "Save As",
+            "Run",
+            "Show Script",
+            "History",
+            "REPL",
+        ] {
+            assert!(texts.iter().any(|(_, t)| t == label), "{label}");
+        }
+        assert!(texts.iter().any(|(p, t)| t == "History" && p.y < 110.0));
+        output.drop_without_applying_deltas();
+        assert_eq!(repl.script.text, "(+ 1 3)");
+        assert!(repl.script.dirty());
+        assert_eq!(
+            egui::TextEdit::load_state(&ctx, id)
+                .unwrap()
+                .cursor
+                .char_range(),
+            before.cursor.char_range()
+        );
+        repl.script_visible = true;
+        draw(&mut repl).drop_without_applying_deltas();
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut repl, vec![ctrl(egui::Key::Z)]).drop_without_applying_deltas();
+        assert_eq!(repl.script.text, "(+ 1 2)");
+    }
+
+    #[test]
+    fn new_and_successful_open_reveal_script_but_failed_open_preserves_it() {
+        let mut repl = Repl::new(|_| {});
+        repl.perform_file_action(FileAction::New);
+        assert!(repl.script_visible);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.scm");
+        std::fs::write(&path, "(+ 2 3)").unwrap();
+        repl.script_visible = false;
+        repl.open_script(&path);
+        assert!(repl.script_visible);
+        assert_eq!(repl.script.text, "(+ 2 3)");
+        repl.script_visible = false;
+        repl.open_script(&dir.path().join("missing.scm"));
+        assert!(!repl.script_visible);
+        assert_eq!(repl.script.text, "(+ 2 3)");
+        assert_eq!(repl.script.path, Some(path.canonicalize().unwrap()));
+    }
+
+    #[test]
     fn formatting_messages_belong_to_their_editor_and_script_saves() {
         let ctx = egui::Context::default();
         let mut repl = Repl::new(|_| {});
+        repl.script_visible = true;
         let script_id = egui::Id::unique("steel_script_editor");
         repl.script.text = "(define upper".into();
         repl.input = "(define lower".into();
@@ -976,6 +1081,7 @@ mod tests {
         let path = dir.path().join("format-save.scm");
         let ctx = egui::Context::default();
         let mut repl = Repl::new(|_| {});
+        repl.script_visible = true;
         let raw = "(  define  имя   1 )";
         repl.script.text = raw.into();
         repl.script.save_as(&path).unwrap();
@@ -1309,6 +1415,7 @@ mod tests {
         }
         let ctx = egui::Context::default();
         let mut repl = Repl::new(|_| {});
+        repl.script_visible = true;
         let output = frame(&ctx, &mut repl, vec![]);
         let horizontal_y = separator(&output, false).y;
         let vertical_x = separator(&output, true).x;
