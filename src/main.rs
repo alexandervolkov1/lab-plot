@@ -3,8 +3,8 @@ use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 #[cfg(test)]
 use lab_plot::plots::{MAX_POINTS, PlotCommand};
 use lab_plot::{
-    integration::{EVENTS_PER_FRAME, Integration},
-    plot_display::{format_x_mark, nearest_sample, sample_text, time_axis},
+    integration::{EVENTS_PER_FRAME, Integration, Phase},
+    plot_display::{format_x_mark, measurement_time, nearest_sample, sample_text, time_axis},
     plots::PlotState,
     steel_api::{register_lab_functions, register_plot_functions},
 };
@@ -75,14 +75,15 @@ impl LabPlot {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Steel").clicked() {
+                if ui.button("REPL").clicked() {
                     self.repl_visible = true;
                 }
                 if ui.button("Journal").clicked() {
                     self.journal_visible = true;
                 }
+                ui.label(self.connection.phase().name());
             });
-            connection_status(ui, &self.connection, &self.plots);
+            stream_warning(ui, &self.connection);
 
             let plot_id = ui.make_persistent_id("main_plot");
             let width = ui.available_width();
@@ -188,7 +189,14 @@ impl LabPlot {
                     .with_title("Journal - TCP / WebSocket")
                     .with_inner_size([760.0, 560.0])
                     .with_min_inner_size([400.0, 280.0]),
-                |ui, _class| journal_viewport_ui(ui, &self.connection, &mut self.journal_visible),
+                |ui, _class| {
+                    journal_viewport_ui(
+                        ui,
+                        &self.connection,
+                        &self.plots,
+                        &mut self.journal_visible,
+                    )
+                },
             );
         }
 
@@ -200,7 +208,21 @@ impl LabPlot {
     }
 }
 
-fn connection_status(ui: &mut egui::Ui, connection: &Integration, plots: &PlotState) {
+fn stream_warning(ui: &mut egui::Ui, connection: &Integration) {
+    if let Some(error) = &connection.stream_error {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "Stream stopped: {error}. Measurement continuity is not guaranteed."
+                ))
+                .color(ui.visuals().error_fg_color),
+            )
+            .wrap(),
+        );
+    }
+}
+
+fn journal_current_state(ui: &mut egui::Ui, connection: &Integration, plots: &PlotState) {
     ui.label(format!(
         "Connection {}: {}",
         connection.connection,
@@ -209,56 +231,80 @@ fn connection_status(ui: &mut egui::Ui, connection: &Integration, plots: &PlotSt
     if let Some(reason) = &connection.reason {
         ui.label(format!("Reason: {reason}"));
     }
-    if let Some(error) = &connection.stream_error {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!("Stream stopped: {error}. Measurement continuity is not guaranteed."),
-        );
+    if connection.stream_error.is_some() {
+        stream_warning(ui, connection);
+    } else {
+        let stream = match connection.phase() {
+            Phase::Ready if connection.subscriptions.is_empty() => "Idle (no subscriptions)",
+            Phase::Ready => "Listening for measurements",
+            Phase::Connecting => "Waiting for connection",
+            Phase::Stopping => "Stopping",
+            Phase::Stopped => "Stopped",
+        };
+        ui.label(format!("Measurement stream: {stream}"));
     }
-    egui::CollapsingHeader::new("Subscriptions and signals")
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.label(format!(
-                "Subscriptions: {}",
-                connection
-                    .subscriptions
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            ui.label("Boolean signals");
-            if connection.boolean_signals.is_empty() {
-                ui.weak("No current Boolean observations");
-            }
-            for (key, state) in &connection.boolean_signals {
-                ui.label(format!(
-                    "{key}    {}    ({} Unix ms)",
-                    state.value, state.completed_at_unix_ms
-                ));
-            }
-            for (key, error) in &connection.signal_errors {
-                ui.colored_label(ui.visuals().error_fg_color, format!("{key}: {error}"));
-            }
-            for (name, series) in &plots.series {
-                if let Some(error) = &series.error {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}"));
-                }
-            }
-        });
+
+    ui.strong("Confirmed subscriptions");
+    if connection.subscriptions.is_empty() {
+        ui.weak("No confirmed subscriptions");
+    }
+    for key in &connection.subscriptions {
+        ui.label(key);
+    }
+
+    ui.strong("Boolean signals");
+    if connection.boolean_signals.is_empty() {
+        ui.weak("No current Boolean observations");
+    }
+    for (key, state) in &connection.boolean_signals {
+        let time = measurement_time(state.completed_at_unix_ms)
+            .unwrap_or_else(|| "invalid timestamp".into());
+        ui.label(format!(
+            "{key}: {}\n{time} ({} Unix ms)",
+            state.value, state.completed_at_unix_ms
+        ));
+    }
+
+    ui.strong("Read errors");
+    if connection.signal_errors.is_empty() {
+        ui.weak("No read errors");
+    }
+    for (key, error) in &connection.signal_errors {
+        ui.colored_label(ui.visuals().error_fg_color, format!("{key}: {error}"));
+    }
+    // Curve diagnostics also live in state, so they survive message eviction.
+    for (name, series) in &plots.series {
+        if let Some(error) = &series.error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Curve {name}: {error}"),
+            );
+        }
+    }
 }
 
-fn journal_viewport_ui(ui: &mut egui::Ui, connection: &Integration, visible: &mut bool) {
+fn journal_viewport_ui(
+    ui: &mut egui::Ui,
+    connection: &Integration,
+    plots: &PlotState,
+    visible: &mut bool,
+) {
     if ui.input(|i| i.viewport().close_requested()) {
         *visible = false;
         return;
     }
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.label(format!(
-            "Connection {}: {}",
-            connection.connection,
-            connection.phase().name()
-        ));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.heading("Current State");
+        // Bound state height so a long subscription list cannot hide Messages.
+        // Each area scrolls independently; short state leaves room for history.
+        egui::ScrollArea::vertical()
+            .id_salt("journal_current_state")
+            .max_height(ui.available_height() * 0.45)
+            .auto_shrink([false, true])
+            .show(ui, |ui| journal_current_state(ui, connection, plots));
+        ui.separator();
+        ui.heading("Messages");
         ui.weak(format!(
             "Last {} entries; {} older entries evicted",
             lab_plot::integration::JOURNAL_CAPACITY,
@@ -361,17 +407,145 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
+    fn painted_text(shape: &egui::epaint::Shape, text: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(t) => {
+                text.push_str(&t.galley.job.text);
+                text.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    painted_text(shape, text);
+                }
+            }
+            _ => (),
+        }
+    }
+
+    fn draw_text(
+        ctx: &egui::Context,
+        size: [f32; 2],
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) -> String {
+        let mut text = String::new();
+        for _ in 0..2 {
+            // A second frame settles scroll area layout.
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, &mut draw);
+            text.clear();
+            for shape in &output.shapes {
+                painted_text(&shape.shape, &mut text);
+            }
+            output.drop_without_applying_deltas();
+        }
+        text
+    }
+
+    fn journal_text(app: &mut LabPlot) -> String {
+        assert!(app.journal_visible);
+        draw_text(&egui::Context::default(), [900.0, 1100.0], |ui| {
+            journal_viewport_ui(ui, &app.connection, &app.plots, &mut app.journal_visible);
+        })
+    }
+
+    fn pump_app(ctx: &egui::Context, app: &mut LabPlot, done: impl Fn(&Integration) -> bool) {
+        let deadline = std::time::Instant::now() + test_support::WAIT;
+        loop {
+            ctx.run_ui(Default::default(), |ui| app.update_ui(ui))
+                .drop_without_applying_deltas();
+            if done(&app.connection) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "GUI update timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
-    fn journal_close_and_reopen_preserve_messages_and_connection() {
-        use lab_plot::integration::{JournalEntry, JournalResult};
-        let ctx = egui::Context::default();
-        let mut c = Integration::default();
-        let mut visible = true;
-        c.journal.push_back(JournalEntry {
-            connection: 1,
-            received_at: std::time::SystemTime::now(),
-            result: JournalResult::Message("retained message".into()),
+    fn journal_tracks_acknowledged_state_while_hidden_and_preserves_it_on_reopen() {
+        use lab_plot::integration::JOURNAL_CAPACITY;
+        use lab_plot::tcp_client::Request;
+        use serde_json::json;
+        use test_support::*;
+
+        let (gate_tx, gate_rx) = std::sync::mpsc::sync_channel(1);
+        let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
+        let (address, server) = mock(move |mut socket| {
+            hello(&mut socket);
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":2,"op":"subscribe","keys":["enabled","fault"]})
+            );
+            seen_tx.send(()).unwrap();
+            gate_rx.recv_timeout(WAIT).unwrap();
+            send(
+                &mut socket,
+                json!({"id":2,"status":"ok","keys":["enabled","fault"]}),
+            );
+            for key in ["enabled", "fault"] {
+                send(
+                    &mut socket,
+                    json!({"event":"measurement","status":"ok","key":key,"value":true,"unit":"","completed_at_unix_ms":1000}),
+                );
+            }
+            assert_eq!(read(&mut socket), json!({"id":3,"op":"ping"}));
+            send(
+                &mut socket,
+                json!({"event":"measurement","status":"ok","key":"enabled","value":false,"unit":"","completed_at_unix_ms":2000}),
+            );
+            send(
+                &mut socket,
+                json!({"event":"measurement","status":"error","key":"fault","error":"read failed","completed_at_unix_ms":2000}),
+            );
+            send(&mut socket, json!({"id":3,"status":"ok"}));
+            assert_eq!(
+                read(&mut socket),
+                json!({"id":4,"op":"unsubscribe","keys":["enabled"]})
+            );
+            seen_tx.send(()).unwrap();
+            gate_rx.recv_timeout(WAIT).unwrap();
+            send(&mut socket, json!({"id":4,"status":"ok","keys":["fault"]}));
+            until_closed(&mut socket);
         });
+
+        let ctx = egui::Context::default();
+        let mut app = LabPlot::new();
+        let sender = app.connection.sender();
+        sender.connect(address).unwrap();
+        pump_app(&ctx, &mut app, |c| c.phase() == Phase::Ready);
+        sender
+            .request(Request::Subscribe {
+                keys: vec!["enabled".into(), "fault".into()],
+            })
+            .unwrap();
+        seen_rx.recv_timeout(WAIT).unwrap();
+        app.journal_visible = true;
+        assert!(journal_text(&mut app).contains("No confirmed subscriptions"));
+        gate_tx.send(()).unwrap();
+        app.journal_visible = false;
+        pump_app(&ctx, &mut app, |c| c.boolean_signals.len() == 2);
+        let text = draw_text(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
+        for hidden in ["enabled", "fault", "Boolean", "subscriptions"] {
+            assert!(!text.contains(hidden), "unexpected {hidden}: {text}");
+        }
+        assert_eq!(app.connection.boolean_signals.len(), 2);
+        app.journal_visible = true;
+        let text = journal_text(&mut app);
+        assert!(text.contains("Confirmed subscriptions\nenabled\nfault\nBoolean signals"));
+        for expected in [
+            "Connection 1: Ready",
+            "Listening for measurements",
+            "enabled: true",
+            "fault: true",
+            "1000 Unix ms",
+            "Request 2",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let history_len = app.connection.journal.len();
         let mut input = egui::RawInput::default();
         input
             .viewports
@@ -379,24 +553,106 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        ctx.run_ui(input, |ui| journal_viewport_ui(ui, &c, &mut visible))
-            .drop_without_applying_deltas();
-        assert!(!visible);
-        assert_eq!(c.journal.len(), 1);
-        assert!(!c.is_closed());
-        c.journal.push_back(JournalEntry {
-            connection: 1,
-            received_at: std::time::SystemTime::now(),
-            result: JournalResult::Message("arrived while hidden".into()),
-        });
-        visible = true;
-        ctx.run_ui(Default::default(), |ui| {
-            journal_viewport_ui(ui, &c, &mut visible)
+        ctx.run_ui(input, |ui| {
+            journal_viewport_ui(ui, &app.connection, &app.plots, &mut app.journal_visible)
         })
         .drop_without_applying_deltas();
-        assert!(visible);
-        assert_eq!(c.journal.len(), 2);
-        assert!(c.journal[0].text().contains("retained message"));
+        assert!(!app.journal_visible);
+        assert_eq!(app.connection.journal.len(), history_len);
+        assert_eq!(app.connection.subscriptions.len(), 2);
+        assert_eq!(app.connection.boolean_signals.len(), 2);
+        assert_eq!(app.connection.phase(), Phase::Ready);
+        assert!(!app.connection.is_closed());
+
+        sender.request(Request::Ping).unwrap();
+        pump_app(&ctx, &mut app, |c| {
+            c.journal.iter().any(|e| e.request_id() == Some(3))
+        });
+        assert!(!app.journal_visible);
+        assert!(!app.connection.boolean_signals["enabled"].value);
+        assert_eq!(app.connection.signal_errors["fault"], "read failed");
+        app.journal_visible = true;
+        let text = journal_text(&mut app);
+        for expected in [
+            "enabled: false",
+            "2000 Unix ms",
+            "fault: read failed",
+            "Request 2",
+            "Request 3",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("fault: true"));
+
+        // Evict the subscribe response through the normal bounded journal path.
+        app.journal_visible = false;
+        for _ in 0..JOURNAL_CAPACITY {
+            sender
+                .plot(PlotCommand::Bind {
+                    name: "missing".into(),
+                    key: "unused".into(),
+                })
+                .unwrap();
+        }
+        pump_app(&ctx, &mut app, |c| c.evicted > 0);
+        assert_eq!(app.connection.journal.len(), JOURNAL_CAPACITY);
+        assert!(
+            app.connection
+                .journal
+                .iter()
+                .all(|e| e.request_id() != Some(2))
+        );
+        app.journal_visible = true;
+        let text = journal_text(&mut app);
+        assert!(text.contains("Confirmed subscriptions\nenabled\nfault\nBoolean signals"));
+        assert!(text.contains("enabled: false"));
+        assert!(text.contains("fault: read failed"));
+        assert!(text.contains(&format!("{} older entries evicted", app.connection.evicted)));
+
+        sender
+            .request(Request::Unsubscribe {
+                keys: vec!["enabled".into()],
+            })
+            .unwrap();
+        seen_rx.recv_timeout(WAIT).unwrap();
+        assert!(journal_text(&mut app).contains("enabled: false"));
+        gate_tx.send(()).unwrap();
+        app.journal_visible = false;
+        pump_app(&ctx, &mut app, |c| !c.subscriptions.contains("enabled"));
+        app.journal_visible = true;
+        let text = journal_text(&mut app);
+        assert!(text.contains("Confirmed subscriptions\nfault\nBoolean signals"));
+        assert!(text.contains("No current Boolean observations"));
+        assert!(text.contains("fault: read failed"));
+        assert_eq!(
+            app.connection
+                .subscriptions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["fault"]
+        );
+
+        app.journal_visible = false;
+        sender.disconnect().unwrap();
+        pump_app(&ctx, &mut app, |c| c.phase() == Phase::Stopped);
+        assert!(app.connection.subscriptions.is_empty());
+        assert!(app.connection.boolean_signals.is_empty());
+        // Existing disconnect rules retain read errors until a fresh connection.
+        assert_eq!(app.connection.signal_errors["fault"], "read failed");
+        app.journal_visible = true;
+        let text = journal_text(&mut app);
+        for expected in [
+            "Connection 1: Stopped",
+            "No confirmed subscriptions",
+            "No current Boolean observations",
+            "Measurement stream: Stopped",
+            "Reason: Shutdown",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!app.connection.is_closed());
+        server.join().unwrap();
     }
 
     #[test]
@@ -452,10 +708,19 @@ mod tests {
     }
 
     #[test]
-    fn boolean_status_panel_displays_values_timestamps_and_read_errors() {
+    fn journal_displays_current_values_timestamps_and_errors_without_messages() {
         let ctx = egui::Context::default();
         let mut connection = Integration::default();
-        let plots = PlotState::default();
+        let mut plots = PlotState::default();
+        plots
+            .apply(PlotCommand::Add {
+                name: "temperature".into(),
+                unit: "K".into(),
+            })
+            .unwrap();
+        plots.series.get_mut("temperature").unwrap().error = Some("unit mismatch".into());
+        connection.reason = Some("connection details".into());
+        connection.subscriptions.insert("enabled".into());
         for (key, value) in [("enabled", true), ("fault", false)] {
             connection.boolean_signals.insert(
                 key.into(),
@@ -465,44 +730,131 @@ mod tests {
                 },
             );
         }
-        fn painted_text(shape: &egui::epaint::Shape, text: &mut String) {
-            match shape {
-                egui::epaint::Shape::Text(t) => text.push_str(&t.galley.job.text),
-                egui::epaint::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        painted_text(shape, text);
-                    }
-                }
-                _ => (),
-            }
-        }
         let draw = |connection: &Integration| {
-            let mut text = String::new();
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                connection_status(ui, connection, &plots)
-            });
-            for shape in &output.shapes {
-                painted_text(&shape.shape, &mut text);
-            }
-            output.drop_without_applying_deltas();
-            text
+            draw_text(&ctx, [900.0, 1100.0], |ui| {
+                journal_viewport_ui(ui, connection, &plots, &mut true);
+            })
         };
-        draw(&connection); // initial layout
         let text = draw(&connection);
-        assert!(text.contains("Boolean signals"));
-        assert!(text.contains("enabled    true    (1234 Unix ms)"));
-        assert!(text.contains("fault    false    (1234 Unix ms)"));
+        for expected in [
+            "Current State",
+            "Messages",
+            "Confirmed subscriptions",
+            "Boolean signals",
+            "enabled: true",
+            "fault: false",
+            "1234 Unix ms",
+            "Reason: connection details",
+            "Curve temperature: unit mismatch",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(text.contains(&measurement_time(1234).unwrap()));
+        assert!(connection.journal.is_empty());
         connection.boolean_signals.remove("enabled");
         connection
             .signal_errors
             .insert("enabled".into(), "read failed".into());
         let text = draw(&connection);
-        assert!(!text.contains("enabled    true"));
+        assert!(!text.contains("enabled: true"));
         assert!(text.contains("enabled: read failed"));
         connection.begin_close();
         let text = draw(&connection);
         assert!(text.contains("No current Boolean observations"));
-        assert!(!text.contains("fault    false"));
+        assert!(!text.contains("fault: false"));
+        connection.stream_error = Some("observation_data_lost".into());
+        let text = draw(&connection);
+        assert!(text.contains("Stream stopped: observation_data_lost"));
+        assert!(text.contains("Measurement continuity is not guaranteed"));
+    }
+
+    #[test]
+    fn main_window_only_shows_controls_status_and_critical_stream_warnings() {
+        use lab_plot::integration::{JournalEntry, JournalResult};
+        let ctx = egui::Context::default();
+        let mut app = LabPlot::new();
+        app.connection
+            .subscriptions
+            .insert("subscription_only".into());
+        app.connection
+            .signal_errors
+            .insert("failed_parameter".into(), "read failed".into());
+        app.connection.reason = Some("ordinary connection details".into());
+        app.connection.journal.push_back(JournalEntry {
+            connection: 1,
+            received_at: std::time::SystemTime::now(),
+            result: JournalResult::Message("history only".into()),
+        });
+        app.plots
+            .apply(PlotCommand::Add {
+                name: "curve".into(),
+                unit: "K".into(),
+            })
+            .unwrap();
+        app.plots.series.get_mut("curve").unwrap().error = Some("curve read error".into());
+        for error in [
+            None,
+            Some("observation_data_lost"),
+            Some("observation_stream_closed"),
+            Some("EventQueueOverflow"),
+        ] {
+            app.connection.stream_error = error.map(str::to_owned);
+            let text = draw_text(&ctx, [900.0, 600.0], |ui| app.update_ui(ui));
+            for expected in ["REPL", "Journal", "Stopped"] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            for hidden in [
+                "Subscriptions",
+                "subscription_only",
+                "Boolean",
+                "failed_parameter",
+                "read failed",
+                "curve read error",
+                "ordinary connection details",
+                "history only",
+                "Server results and subscriptions",
+            ] {
+                assert!(!text.contains(hidden), "unexpected {hidden}: {text}");
+            }
+            if let Some(error) = error {
+                assert!(text.contains(error));
+                assert!(text.contains("Measurement continuity is not guaranteed"));
+            } else {
+                assert!(!text.contains("Stream stopped"));
+            }
+        }
+    }
+
+    #[test]
+    fn journal_keeps_both_areas_visible_when_resized_with_many_subscriptions() {
+        use lab_plot::integration::{JournalEntry, JournalResult};
+        let ctx = egui::Context::default();
+        apply_mirage_theme(&ctx);
+        let mut connection = Integration::default();
+        connection
+            .subscriptions
+            .extend((0..100).map(|i| format!("instrument/very/long/parameter/name/{i}")));
+        connection.journal.push_back(JournalEntry {
+            connection: 1,
+            received_at: std::time::SystemTime::now(),
+            result: JournalResult::Message("history remains visible".into()),
+        });
+        for size in [[760.0, 560.0], [400.0, 280.0], [1000.0, 800.0]] {
+            let text = draw_text(&ctx, size, |ui| {
+                journal_viewport_ui(ui, &connection, &PlotState::default(), &mut true);
+            });
+            for expected in [
+                "Current State",
+                "Messages",
+                "Connection 0: Stopped",
+                "history remains visible",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "size {size:?}, missing {expected}: {text}"
+                );
+            }
+        }
     }
 
     #[test]
