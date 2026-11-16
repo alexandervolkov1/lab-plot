@@ -237,3 +237,6 @@ mod tests {
         contract(true);
     }
 }
+
+#[cfg(test)]
+mod processing;

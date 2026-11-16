@@ -248,6 +248,67 @@ fn steel_confirmed_results_types_errors_and_structured_describe_over_tcp_and_ws(
 }
 
 #[test]
+fn generic_component_wrappers_preserve_schema_data_and_mutation_errors() {
+    for ws in [false, true] {
+        let mut c = Integration::default();
+        let mut p = PlotState::default();
+        let steel = SteelWorker::new(c.sender());
+        let (endpoint, task) = server(ws, |mut peer| {
+            peer.hello();
+            for action in [
+                "types",
+                "list",
+                "create",
+                "configure",
+                "bind",
+                "state",
+                "delete",
+                "outputs",
+            ] {
+                let request = peer.read();
+                assert_eq!(request["op"], "components");
+                assert_eq!(request["command"]["action"], action);
+                if action == "delete" {
+                    peer.send(
+                        json!({"id":request["id"],"status":"error","error":"revision_conflict"}),
+                    );
+                } else {
+                    peer.send(json!({"id":request["id"],"status":"ok","data":{"revision":7,"enabled":true,"nested":[1,2.5,"custom_type"]}}));
+                }
+            }
+            peer.until_closed();
+        });
+        c.sender().connect_endpoint(endpoint).unwrap();
+        pump(&mut c, &mut p, |c| c.phase() == Phase::Ready);
+        for source in [
+            "(lab/component-types)",
+            "(lab/components)",
+            r#"(lab/component-create! "{}" 0)"#,
+            r#"(lab/component-configure! "{}" 1)"#,
+            r#"(lab/controller-bind! "c" "a/power" 1000 2)"#,
+            r#"(lab/controller-state! "c" "shadow" 3)"#,
+        ] {
+            let result = result(&mut c, &mut p, steel.eval(source.into())).unwrap();
+            assert!(result[0].contains("custom_type"));
+            assert!(result[0].contains("#true") || result[0].contains("#t"));
+        }
+        assert!(
+            result(
+                &mut c,
+                &mut p,
+                steel.eval(r#"(lab/component-delete! "c" #t 3)"#.into())
+            )
+            .unwrap_err()
+            .contains("revision_conflict")
+        );
+        result(&mut c, &mut p, steel.eval("(lab/outputs)".into())).unwrap();
+        c.begin_close();
+        pump(&mut c, &mut p, Integration::is_closed);
+        task.join().unwrap();
+    }
+}
+
+#[test]
 fn slow_server_does_not_block_gui_and_replies_are_matched_out_of_order() {
     for ws in [false, true] {
         let mut c = Integration::default();

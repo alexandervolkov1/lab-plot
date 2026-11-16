@@ -51,6 +51,7 @@ fn description(parameters: &[Parameter], actions: &[ActionDescription]) -> Strin
 }
 fn response(data: &ResponseData) -> String {
     match data {
+        ResponseData::Components(value) => format!("Components - Status: ok\n{value:#}"),
         ResponseData::Ack => "ACK · Status: ok".into(),
         ResponseData::Hello { protocol, version } => {
             format!("hello · Status: ok\n  protocol: {protocol}\n  version: {version}")

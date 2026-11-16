@@ -160,6 +160,7 @@ fn parameter(p: Parameter) -> SteelVal {
 }
 fn response_value(data: ResponseData) -> Result<SteelVal, String> {
     Ok(match data {
+        ResponseData::Components(value) => json_value(value),
         ResponseData::Ack => SteelVal::BoolV(true),
         ResponseData::NoData { .. } => absent(),
         ResponseData::Measurement(m) => match m.reading {
@@ -262,6 +263,104 @@ pub fn register_plot_functions(engine: &mut Engine, sender: ControlSender) {
 }
 
 pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
+    for (function, action) in [
+        ("lab/component-create!", "create"),
+        ("lab/component-configure!", "configure"),
+    ] {
+        let tx = sender.clone();
+        engine.register_fn(
+            function,
+            move |configuration: String, revision: u64| -> Result<SteelVal, String> {
+                text_limit(&configuration)?;
+                let configuration: serde_json::Value =
+                    serde_json::from_str(&configuration).map_err(|e| e.to_string())?;
+                tx.request_wait(Request::Components {
+                    command: serde_json::json!({
+                        "action": action,
+                        "configuration": configuration,
+                        "expected_revision": revision
+                    }),
+                })
+                .and_then(response_value)
+            },
+        );
+    }
+    let tx = sender.clone();
+    engine.register_fn(
+        "lab/component-delete!",
+        move |name: String, cascade: bool, revision: u64| {
+            tx.request_wait(Request::Components {
+                command: serde_json::json!({
+                    "action": "delete", "name": name, "cascade": cascade,
+                    "expected_revision": revision
+                }),
+            })
+            .and_then(response_value)
+        },
+    );
+    let tx = sender.clone();
+    engine.register_fn(
+        "lab/controller-state!",
+        move |name: String, state: String, revision: u64| {
+            tx.request_wait(Request::Components {
+                command: serde_json::json!({
+                    "action": "state", "name": name, "state": state,
+                    "expected_revision": revision
+                }),
+            })
+            .and_then(response_value)
+        },
+    );
+    let tx = sender.clone();
+    engine.register_fn(
+        "lab/controller-bind!",
+        move |name: String, target: String, timeout: u64, revision: u64| {
+            tx.request_wait(Request::Components {
+                command: serde_json::json!({
+                    "action": "bind", "name": name, "target": target,
+                    "command_timeout_ms": timeout, "expected_revision": revision
+                }),
+            })
+            .and_then(response_value)
+        },
+    );
+
+    let tx = sender.clone();
+    engine.register_fn("lab/components", move || {
+        tx.request_wait(Request::Components {
+            command: serde_json::json!({"action":"list"}),
+        })
+        .and_then(response_value)
+    });
+    let tx = sender.clone();
+    engine.register_fn("lab/component-types", move || {
+        tx.request_wait(Request::Components {
+            command: serde_json::json!({"action":"types"}),
+        })
+        .and_then(response_value)
+    });
+    let tx = sender.clone();
+    engine.register_fn("lab/outputs", move || {
+        tx.request_wait(Request::Components {
+            command: serde_json::json!({"action":"outputs"}),
+        })
+        .and_then(response_value)
+    });
+    let tx = sender.clone();
+    engine.register_fn(
+        "lab/component!",
+        move |command: String| -> Result<SteelVal, String> {
+            text_limit(&command)?;
+            let command: serde_json::Value =
+                serde_json::from_str(&command).map_err(|e| e.to_string())?;
+            if !command.is_object() {
+                return Err("Expected component command object".into());
+            }
+            tx.request_wait(Request::Components { command })
+                .and_then(response_value)
+        },
+    );
+
     let tx = sender.clone();
     engine.register_fn(
         "lab/connect!",
@@ -314,6 +413,30 @@ pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
                 .and_then(response_value)
         },
     );
+}
+
+// Descriptor-driven conversion; no component implementation names in the client.
+fn json_value(value: serde_json::Value) -> SteelVal {
+    match value {
+        serde_json::Value::Null => absent(),
+        serde_json::Value::Bool(v) => SteelVal::BoolV(v),
+        serde_json::Value::String(v) => string(v),
+        serde_json::Value::Number(v) => {
+            if let Some(n) = v.as_i64() {
+                scalar(ScalarValue::Integer(n))
+            } else if let Some(n) = v.as_u64() {
+                unsigned_integer(n)
+            } else {
+                SteelVal::NumV(v.as_f64().expect("JSON number"))
+            }
+        }
+        serde_json::Value::Array(values) => list(values.into_iter().map(json_value)),
+        serde_json::Value::Object(values) => list(
+            values
+                .into_iter()
+                .map(|(k, v)| list([string(k), json_value(v)])),
+        ),
+    }
 }
 
 #[cfg(test)]

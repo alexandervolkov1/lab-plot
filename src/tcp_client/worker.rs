@@ -504,6 +504,7 @@ fn matches_request(request: &Request, response: &ResponseData) -> bool {
         };
     }
     match (request, response) {
+        (Request::Components { .. }, ResponseData::Components(_)) => true,
         (Request::Ping | Request::Set { .. } | Request::InvokeAction { .. }, ResponseData::Ack)
         | (Request::Describe, ResponseData::Parameters(_) | ResponseData::Description { .. })
         | (

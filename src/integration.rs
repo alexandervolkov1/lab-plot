@@ -129,7 +129,10 @@ impl ControlSender {
     /// waiter insertion share update's lock: even an immediate reply cannot race.
     /// The bounded wait below holds no mutex and does no network I/O.
     pub fn request_wait(&self, request: Request) -> Result<ResponseData, String> {
-        let mutation = matches!(request, Request::Set { .. } | Request::InvokeAction { .. });
+        let mutation = matches!(
+            request,
+            Request::Set { .. } | Request::InvokeAction { .. } | Request::Components { .. }
+        );
         let (tx, rx) = mpsc::sync_channel(1);
         let (key, timeout) = {
             let mut bridge = lock(&self.shared);

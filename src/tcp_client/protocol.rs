@@ -50,6 +50,7 @@ pub struct ServerError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseData {
+    Components(serde_json::Value),
     Ack,
     Hello {
         protocol: String,
@@ -286,6 +287,7 @@ pub fn parse_message(frame: &str) -> Result<Incoming, ParseError> {
             return Err(ParseError("invalid response id".into()));
         }
         let data = match status.as_str() {
+            "ok" if object.0.contains_key("data") => ResponseData::Components(object.take("data")?),
             "ok" if object.0.contains_key("protocol") => ResponseData::Hello {
                 protocol: object.take("protocol")?,
                 version: object.take("version")?,

@@ -52,6 +52,7 @@ pub enum ScalarValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
+    Components { command: serde_json::Value },
     Ping,
     Describe,
     Get { key: String },
@@ -75,6 +76,7 @@ pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError>
 
     // Bound temporary serialization allocations as well as the resulting frame.
     let payload_size = match request {
+        Request::Components { command } => command.to_string().len(),
         Request::Get { key } | Request::Set { key, .. } | Request::InvokeAction { key } => {
             key.len()
         }
@@ -91,6 +93,7 @@ pub fn encode_request(id: u64, request: &Request) -> Result<String, EncodeError>
     }
 
     let message = match request {
+        Request::Components { command } => json!({"id":id,"op":"components","command":command}),
         Request::Ping => json!({
             "id": id,
             "op": "ping"
