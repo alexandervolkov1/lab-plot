@@ -63,6 +63,26 @@ After data loss a controller remains faulted until an explicit shadow restart, t
 an independent Auto request. Outcome unknown blocks Auto for that server lifetime;
 manual requests retain their explicit operator semantics. Inspect `lab/outputs`.
 
+`(lab/components)` now includes `binding` on every instance. A controller without a
+binding (and a filter) returns null, represented as an empty Steel list. A binding
+is an association list such as `(("target" "furnace1/power") ("command_timeout_ms" 1000))`;
+it remains visible in Shadow, Stopped and Fault. Another connected client can inspect
+the same binding. Every mutation snapshot uses the same format. Recreating a name
+does not inherit the deleted incarnation's binding.
+
+To inspect the complete snapshot after binding, including its current revision:
+
+```scheme
+(lab/components)
+;; Additional pages, when next_offset is non-null:
+(lab/component! "{\"action\":\"list\",\"offset\":16,\"limit\":16}")
+```
+
+Changing a component's inputs closes affected subscriptions with
+`observation_stream_closed`, including descendants and a rewire within one physical
+port. Reconnect and subscribe again to begin the new history. Retuning parameters
+alone preserves subscriptions; independent signals continue normally.
+
 Deletion with active subscribers terminates those streams explicitly. Unsubscribe first
 if retaining the connection is desired; then use `lab/component-delete!` with the current
 revision. Cascade also stops/removes dependent controllers. Reconnection does not restart
@@ -71,9 +91,14 @@ controllers and does not replay earlier measurements.
 Validation on this branch: Debug/Release builds, fmt, check --all-targets,
 Clippy --all-targets -- -D warnings and git diff --check passed. Each full test
 profile passed 143 tests, with one pre-existing external-server test ignored.
-The opt-in `tests/server_contract/Cargo.toml` suite passed all three tests against
-an in-process server, including real Arduino protocol parsing through EMA into
-PlotState. The new pipeline test passed on three additional runs. No serial port
-was opened. Four existing GUI/Steel tests hit their time limits during a simultaneous
-server/client validation run; the complete isolated rerun passed without changing
-those tests or their deadlines.
+The opt-in `tests/server_contract/Cargo.toml` suite now passes all four tests in
+Debug and Release against an in-process server. It covers real Arduino protocol
+parsing through EMA into PlotState and the Managed Arduino → EMA → PID → output
+path, binding visibility from another client, direct-handle rejection, Manual/Auto
+and shutdown over both TCP and WS. The Managed client scenario also passed five
+additional runs per profile. No serial port was opened. The production client and
+`arduino-start.scm` did not need changes for these review fixes.
+
+During the initial implementation, four existing GUI/Steel tests hit their time
+limits in a simultaneous server/client validation run; its isolated rerun passed.
+The complete review reruns passed without changing those tests or their deadlines.

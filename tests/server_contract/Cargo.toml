@@ -1,7 +1,7 @@
-# Opt-in integration with the sibling lab-server checkout (tested at c973a02).
+# Opt-in integration with the sibling lab-server processing-components checkout.
 # CARGO_TARGET_DIR must point at the existing shared build directory.
 # cargo test --manifest-path tests/server_contract/Cargo.toml
-# Only an in-memory driver is constructed; no serial port or startup config is used.
+# All transports are in memory; TOML startup tests inject an opener and never open serial ports.
 [package]
 name = "lab-plot-server-contract"
 version = "0.0.0"
