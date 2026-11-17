@@ -80,6 +80,30 @@ struct EvalRequest {
     path: Option<PathBuf>,
 }
 
+struct EvalResponse {
+    output: String,
+    finished: bool,
+    preload_failed: bool,
+}
+
+fn evaluate(engine: &mut Engine, request: EvalRequest) -> Result<String, String> {
+    let result = match request.path {
+        Some(path) => engine.compile_and_run_raw_program_with_path(request.source, path),
+        None => engine.compile_and_run_raw_program(request.source),
+    };
+    result
+        .map(|values| {
+            let text = values
+                .into_iter()
+                .filter(|value| !matches!(value, SteelVal::Void))
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() { "ok".into() } else { text }
+        })
+        .map_err(|error| format!("Error: {error}"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     New,
@@ -103,38 +127,66 @@ pub struct Repl {
     reset_script_cursor: bool,
     busy: bool,
     request_tx: Sender<EvalRequest>,
-    response_rx: Receiver<String>,
+    response_rx: Receiver<EvalResponse>,
     command_history: CommandHistory,
 }
 
 impl Repl {
-    pub fn new(configure: impl FnOnce(&mut Engine) + Send + 'static) -> Self {
+    pub fn new(
+        preload_scripts: Vec<PathBuf>,
+        configure: impl FnOnce(&mut Engine) + Send + 'static,
+    ) -> Self {
+        let busy = !preload_scripts.is_empty();
         let (request_tx, request_rx) = mpsc::channel::<EvalRequest>();
-        let (response_tx, response_rx) = mpsc::channel::<String>();
+        let (response_tx, response_rx) = mpsc::channel::<EvalResponse>();
 
         thread::spawn(move || {
             let mut engine = Engine::new();
             configure(&mut engine);
+            for (index, path) in preload_scripts.iter().enumerate() {
+                let result = (|| {
+                    // Resolve paths and read files on the same worker as evaluation.
+                    let path = path.canonicalize().map_err(|e| format!("Error: {e}"))?;
+                    let source =
+                        std::fs::read_to_string(&path).map_err(|e| format!("Error: {e}"))?;
+                    evaluate(
+                        &mut engine,
+                        EvalRequest {
+                            source,
+                            path: Some(path),
+                        },
+                    )
+                })();
+                let failed = result.is_err();
+                let output = format!(
+                    "Preload script: {}\n{}",
+                    path.display(),
+                    result.unwrap_or_else(|e| e)
+                );
+                if response_tx
+                    .send(EvalResponse {
+                        output,
+                        finished: failed || index + 1 == preload_scripts.len(),
+                        preload_failed: failed,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if failed {
+                    break;
+                }
+            }
             while let Ok(request) = request_rx.recv() {
-                let result = match request.path {
-                    Some(path) => {
-                        engine.compile_and_run_raw_program_with_path(request.source, path)
-                    }
-                    None => engine.compile_and_run_raw_program(request.source),
-                };
-                let output = match result {
-                    Ok(values) => {
-                        let text = values
-                            .into_iter()
-                            .filter(|value| !matches!(value, SteelVal::Void))
-                            .map(|value| value.to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if text.is_empty() { "ok".into() } else { text }
-                    }
-                    Err(error) => format!("Error: {error}"),
-                };
-                if response_tx.send(output).is_err() {
+                let output = evaluate(&mut engine, request).unwrap_or_else(|e| e);
+                if response_tx
+                    .send(EvalResponse {
+                        output,
+                        finished: true,
+                        preload_failed: false,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -154,21 +206,24 @@ impl Repl {
             pending_save: None,
             close_allowed: false,
             reset_script_cursor: false,
-            busy: false,
+            busy,
             request_tx,
             response_rx,
             command_history: CommandHistory::default(),
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Returns true when a startup error should reveal the REPL window.
+    pub fn poll(&mut self) -> bool {
+        let mut preload_failed = false;
         loop {
             match self.response_rx.try_recv() {
                 Ok(result) => {
-                    self.record_history(&result);
-                    self.last_output = result;
+                    preload_failed |= result.preload_failed;
+                    self.record_history(&result.output);
+                    self.last_output = result.output;
                     self.scroll_history_to_end = true;
-                    self.busy = false;
+                    self.busy = !result.finished;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -182,6 +237,7 @@ impl Repl {
                 }
             }
         }
+        preload_failed
     }
 
     fn record_history(&mut self, entry: &str) {
@@ -769,9 +825,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preload_files_run_once_in_order_and_share_repl_engine_and_module_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("helper.scm"),
+            "(provide twice) (define (twice x) (* 2 x))",
+        )
+        .unwrap();
+        let base = dir.path().join("база.scm");
+        let experiment = dir.path().join("experiment.scm");
+        std::fs::write(
+            &base,
+            "(require \"helper.scm\") (define answer (twice 20)) (define runs 0)",
+        )
+        .unwrap();
+        std::fs::write(
+            &experiment,
+            "(set! runs (+ runs 1)) (set! answer (+ answer 2)) answer",
+        )
+        .unwrap();
+        for paths in [vec![base.clone()], vec![base.clone(), experiment.clone()]] {
+            let multiple = paths.len() == 2;
+            let mut repl = Repl::new(paths, |_| {});
+            assert!(repl.busy);
+            finish(&mut repl);
+            assert!(!repl.last_output.contains("Error:"), "{}", repl.last_output);
+            assert!(repl.history[0].contains(&base.display().to_string()));
+            assert_eq!(repl.history.len(), if multiple { 2 } else { 1 });
+            assert!(repl.script.path.is_none() && repl.script.text.is_empty());
+            for _ in 0..2 {
+                repl.input = "(list answer runs (twice 3))".into();
+                repl.execute_input();
+                finish(&mut repl);
+                assert_eq!(
+                    repl.last_output,
+                    if multiple { "(42 1 6)" } else { "(40 0 6)" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preload_read_syntax_and_runtime_errors_stop_remaining_files_but_repl_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.scm");
+        let bad = dir.path().join("bad.scm");
+        let tail = dir.path().join("tail.scm");
+        std::fs::write(&base, "(define answer 42) (define tail-ran #f)").unwrap();
+        std::fs::write(&tail, "(set! tail-ran #t)").unwrap();
+        for source in [
+            None,
+            Some("(define broken"),
+            Some("(error \"startup failed\")"),
+        ] {
+            if let Some(source) = source {
+                std::fs::write(&bad, source).unwrap();
+            }
+            let mut repl = Repl::new(vec![base.clone(), bad.clone(), tail.clone()], |_| {});
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut reveal_error = false;
+            while repl.busy {
+                reveal_error |= repl.poll();
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(reveal_error);
+            assert!(repl.last_output.contains(&bad.display().to_string()));
+            assert!(repl.last_output.contains("Error:"), "{}", repl.last_output);
+            assert_eq!(repl.history.len(), 2);
+            let output = frame(&egui::Context::default(), &mut repl, vec![]);
+            output.drop_without_applying_deltas();
+            repl.input = "(list answer tail-ran)".into();
+            repl.execute_input();
+            finish(&mut repl);
+            assert_eq!(repl.last_output, "(42 #false)");
+        }
+    }
+
+    #[test]
+    fn gui_frames_continue_while_startup_script_is_blocked_on_worker() {
+        use steel::steel_vm::register_fn::RegisterFn;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("waiting.scm");
+        std::fs::write(&path, "(wait-for-test) (define answer 42)").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut repl = Repl::new(vec![path], move |engine| {
+            engine.register_fn("wait-for-test", move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+            });
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            assert!(!repl.poll());
+            assert!(repl.busy);
+            frame(&ctx, &mut repl, vec![]).drop_without_applying_deltas();
+        }
+        release_tx.send(()).unwrap();
+        finish(&mut repl);
+        repl.input = "answer".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert_eq!(repl.last_output, "42");
+    }
+
+    #[test]
     fn collapse_preserves_editor_state_and_expands_lower_area_at_minimum_size() {
         let ctx = egui::Context::default();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         assert!(!repl.script_visible);
         repl.script.text = "(+ 1 2)".into();
         let id = egui::Id::unique("steel_script_editor");
@@ -833,7 +1003,7 @@ mod tests {
 
     #[test]
     fn new_and_successful_open_reveal_script_but_failed_open_preserves_it() {
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.perform_file_action(FileAction::New);
         assert!(repl.script_visible);
         let dir = tempfile::tempdir().unwrap();
@@ -853,7 +1023,7 @@ mod tests {
     #[test]
     fn formatting_messages_belong_to_their_editor_and_script_saves() {
         let ctx = egui::Context::default();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script_visible = true;
         let script_id = egui::Id::unique("steel_script_editor");
         repl.script.text = "(define upper".into();
@@ -1080,7 +1250,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("format-save.scm");
         let ctx = egui::Context::default();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script_visible = true;
         let raw = "(  define  имя   1 )";
         repl.script.text = raw.into();
@@ -1110,7 +1280,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conflict.scm");
         let ctx = egui::Context::default();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.save_as(&path).unwrap();
         let raw = "( +  1   2 )";
         repl.script.text = raw.into();
@@ -1127,7 +1297,7 @@ mod tests {
 
     #[test]
     fn void_success_values_and_errors_are_recorded_in_existing_history() {
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.input = "(define x 10)".into();
         repl.execute_input();
         finish(&mut repl);
@@ -1163,7 +1333,7 @@ mod tests {
 
     #[test]
     fn dirty_close_is_cancelled_at_viewport_level_and_cancel_keeps_buffer() {
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         assert!(repl.request_close());
         repl.script.text = "unsaved script".into();
         let ctx = egui::Context::default();
@@ -1194,7 +1364,7 @@ mod tests {
     fn close_only_proceeds_after_successful_save_or_explicit_discard() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close.scm");
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.save_as(&path).unwrap();
         repl.script.text = "unsaved".into();
         // Reading a directory as a file fails; it must never count as unchanged.
@@ -1214,7 +1384,7 @@ mod tests {
             schemat::format_string("unsaved").unwrap()
         );
 
-        let mut discarded = Repl::new(|_| {});
+        let mut discarded = Repl::new(Vec::new(), |_| {});
         discarded.script.text = "discard me".into();
         assert!(!discarded.request_close());
         discarded.complete_pending_action(); // Discard button.
@@ -1226,7 +1396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conflict.scm");
         std::fs::write(&path, "original").unwrap();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.open(&path).unwrap();
         repl.script.text = "local edit".into();
         std::fs::write(&path, "external edit").unwrap();
@@ -1253,7 +1423,7 @@ mod tests {
 
     #[test]
     fn hidden_history_has_bounded_utf8_entries_and_script_summaries() {
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.text = format!(";{}", "large script source".repeat(10000));
         repl.run_script();
         finish(&mut repl);
@@ -1274,7 +1444,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         repl.response_rx = rx;
         for _ in 0..MAX_HIDDEN_HISTORY + 5 {
-            tx.send(long_result.clone()).unwrap();
+            tx.send(EvalResponse {
+                output: long_result.clone(),
+                finished: true,
+                preload_failed: false,
+            })
+            .unwrap();
             repl.poll();
         }
         assert_eq!(repl.history.len(), MAX_HIDDEN_HISTORY);
@@ -1322,7 +1497,7 @@ mod tests {
     fn ui_file_shortcuts_save_and_require_confirmation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keyboard.scm");
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.save_as(&path).unwrap();
         repl.script.text = "; несохранённый скрипт\n".into();
         let ctx = egui::Context::default();
@@ -1352,7 +1527,7 @@ mod tests {
                 _ => {}
             }
         }
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.text = "(define retained 42)".into();
         repl.input = "unfinished input".into();
         repl.history.push_back("PREVIOUS_RESULT_VISIBLE".into());
@@ -1414,7 +1589,7 @@ mod tests {
             }
         }
         let ctx = egui::Context::default();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script_visible = true;
         let output = frame(&ctx, &mut repl, vec![]);
         let horizontal_y = separator(&output, false).y;
@@ -1520,7 +1695,9 @@ mod tests {
     fn script_and_repl_share_engine_but_keep_independent_buffers() {
         let mut connection = lab_plot::integration::Integration::default();
         let tx = connection.sender();
-        let mut repl = Repl::new(move |engine| crate::register_plot_functions(engine, tx));
+        let mut repl = Repl::new(Vec::new(), move |engine| {
+            crate::register_plot_functions(engine, tx)
+        });
         let source = "(define (square x) (* x x))\n(plot/add! \"sample\" \"degC\")\n(plot/point! \"sample\" 0.0 20.0)";
         repl.script.text = source.into();
         repl.input = "(square 5)".into();
@@ -1574,7 +1751,7 @@ mod tests {
             "(require \"helper.scm\")\n(define answer (twice 21))\nanswer",
         )
         .unwrap();
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.open(&path).unwrap();
         assert!(!repl.busy); // Opening is never evaluation.
         repl.run_script();
@@ -1598,7 +1775,7 @@ mod tests {
 
     #[test]
     fn new_and_open_wait_for_confirmation_without_destroying_buffers() {
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.script.text = "unsaved script".into();
         repl.input = "unfinished REPL".into();
         for action in [FileAction::New, FileAction::Open] {
@@ -1617,7 +1794,7 @@ mod tests {
     fn failed_submission_preserves_repl_input_and_history() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        let mut repl = Repl::new(|_| {});
+        let mut repl = Repl::new(Vec::new(), |_| {});
         repl.request_tx = tx;
         repl.input = "(+ 1 2)".into();
         repl.execute_input();

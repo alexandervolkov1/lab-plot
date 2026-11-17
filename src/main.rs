@@ -10,6 +10,7 @@ use lab_plot::{
     plots::PlotState,
     steel_api::{register_lab_functions, register_plot_functions},
 };
+use std::path::PathBuf;
 use std::time::Duration;
 mod repl;
 #[cfg(test)]
@@ -38,17 +39,18 @@ struct LabPlot {
 }
 
 impl LabPlot {
-    fn new() -> Self {
+    fn new(preload_scripts: Vec<PathBuf>) -> Self {
+        let repl_visible = !preload_scripts.is_empty();
         let connection = Integration::default();
         let sender = connection.sender();
-        let repl = repl::Repl::new(move |engine| {
+        let repl = repl::Repl::new(preload_scripts, move |engine| {
             register_plot_functions(engine, sender.clone());
             register_lab_functions(engine, sender);
         });
 
         Self {
             repl,
-            repl_visible: false,
+            repl_visible,
             journal_visible: false,
             connection,
             plots: PlotState::default(),
@@ -65,7 +67,9 @@ impl eframe::App for LabPlot {
 impl LabPlot {
     fn update_ui(&mut self, ui: &mut egui::Ui) {
         let processed = self.connection.update(&mut self.plots);
-        self.repl.poll();
+        if self.repl.poll() {
+            self.repl_visible = true;
+        }
         if self.repl.close_ui(ui) {
             self.connection.begin_close();
             if !self.connection.is_closed() {
@@ -362,7 +366,35 @@ fn journal_viewport_ui(
     });
 }
 
+fn parse_preload_scripts(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut args = args.into_iter();
+    let mut scripts = Vec::new();
+    while let Some(flag) = args.next() {
+        if flag != "--preload-script" {
+            return Err(format!(
+                "Unknown argument: {}. Usage: lab-plot [--preload-script <path.scm>]...",
+                flag.to_string_lossy()
+            ));
+        }
+        let path = args
+            .next()
+            .filter(|path| !path.is_empty() && !path.to_string_lossy().starts_with("--"))
+            .ok_or("--preload-script requires a file path")?;
+        scripts.push(path.into());
+    }
+    Ok(scripts)
+}
+
 fn main() -> eframe::Result {
+    let preload_scripts = match parse_preload_scripts(std::env::args_os().skip(1)) {
+        Ok(scripts) => scripts,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 600.0]),
         ..Default::default()
@@ -371,9 +403,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "lab-plot",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             apply_mirage_theme(&cc.egui_ctx);
-            Ok(Box::new(LabPlot::new()))
+            Ok(Box::new(LabPlot::new(preload_scripts)))
         }),
     )
 }
@@ -441,6 +473,54 @@ fn apply_mirage_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preload_arguments_are_optional_ordered_and_require_paths() {
+        let parse =
+            |args: &[&str]| parse_preload_scripts(args.iter().map(std::ffi::OsString::from));
+        assert!(parse(&[]).unwrap().is_empty());
+        assert_eq!(
+            parse(&["--preload-script", "scripts/база с пробелами.scm"]).unwrap(),
+            vec![PathBuf::from("scripts/база с пробелами.scm")]
+        );
+        assert_eq!(
+            parse(&[
+                "--preload-script",
+                "base.scm",
+                "--preload-script",
+                "experiment.scm"
+            ])
+            .unwrap(),
+            vec![PathBuf::from("base.scm"), PathBuf::from("experiment.scm")]
+        );
+        for args in [
+            vec!["--preload-script"],
+            vec!["--preload-script", ""],
+            vec!["--preload-script", "--preload-script", "file.scm"],
+            vec!["--unknown"],
+            vec!["file.scm"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let app = LabPlot::new(Vec::new());
+        assert!(!app.repl_visible);
+    }
+
+    #[test]
+    fn preload_error_reveals_repl_even_if_closed_during_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = LabPlot::new(vec![dir.path().join("missing.scm")]);
+        assert!(app.repl_visible);
+        app.repl_visible = false;
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !app.repl_visible {
+            ctx.run_ui(Default::default(), |ui| app.update_ui(ui))
+                .drop_without_applying_deltas();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     fn painted_labels(shape: &egui::epaint::Shape, labels: &mut Vec<egui::epaint::TextShape>) {
         match shape {
@@ -589,7 +669,7 @@ mod tests {
                 plot_id = ui.make_persistent_id("main_plot");
             });
         });
-        let mut app = LabPlot::new();
+        let mut app = LabPlot::new(Vec::new());
         app.plots
             .apply(PlotCommand::Add {
                 name: "Temperature".into(),
@@ -705,7 +785,7 @@ mod tests {
     fn manual_points_keep_numeric_ticks_even_at_unix_sized_coordinates() {
         for start in [0.0, 1_794_565_335.0] {
             let ctx = egui::Context::default();
-            let mut app = LabPlot::new();
+            let mut app = LabPlot::new(Vec::new());
             for offset in [0.0, 30.0, 60.0] {
                 app.plots
                     .apply(PlotCommand::Point {
@@ -774,7 +854,7 @@ mod tests {
         });
 
         let ctx = egui::Context::default();
-        let mut app = LabPlot::new();
+        let mut app = LabPlot::new(Vec::new());
         let sender = app.connection.sender();
         sender.connect(address).unwrap();
         pump_app(&ctx, &mut app, |c| c.phase() == Phase::Ready);
@@ -926,7 +1006,7 @@ mod tests {
             test_support::until_closed(&mut socket);
         });
         let ctx = egui::Context::default();
-        let mut app = LabPlot::new();
+        let mut app = LabPlot::new(Vec::new());
         app.connection.sender().connect(address).unwrap();
         ctx.run_ui(egui::RawInput::default(), |ui| app.update_ui(ui))
             .drop_without_applying_deltas();
@@ -1034,7 +1114,7 @@ mod tests {
     fn main_window_only_shows_controls_status_and_critical_stream_warnings() {
         use lab_plot::integration::{JournalEntry, JournalResult};
         let ctx = egui::Context::default();
-        let mut app = LabPlot::new();
+        let mut app = LabPlot::new(Vec::new());
         app.connection
             .subscriptions
             .insert("subscription_only".into());
@@ -1123,7 +1203,7 @@ mod tests {
     fn headless_gui_draws_discontinuous_curves_and_handles_close() {
         use lab_plot::tcp_client::{Measurement, Reading, ScalarValue};
         let ctx = egui::Context::default();
-        let mut app = LabPlot::new();
+        let mut app = LabPlot::new(Vec::new());
         app.plots
             .apply(PlotCommand::Add {
                 name: "A".into(),
