@@ -40,7 +40,6 @@ struct LabPlot {
 
 impl LabPlot {
     fn new(preload_scripts: Vec<PathBuf>) -> Self {
-        let repl_visible = !preload_scripts.is_empty();
         let connection = Integration::default();
         let sender = connection.sender();
         let repl = repl::Repl::new(preload_scripts, move |engine| {
@@ -50,7 +49,7 @@ impl LabPlot {
 
         Self {
             repl,
-            repl_visible,
+            repl_visible: false,
             journal_visible: false,
             connection,
             plots: PlotState::default(),
@@ -218,7 +217,7 @@ fn main_menu(ui: &mut egui::Ui, phase: Phase, repl_visible: &mut bool, journal_v
     ui.horizontal(|ui| {
         let center_x = ui.available_rect_before_wrap().center().x;
         if ui.button("REPL").clicked() {
-            *repl_visible = true;
+            *repl_visible = !*repl_visible;
         }
         if ui.button("Journal").clicked() {
             *journal_visible = true;
@@ -510,8 +509,7 @@ mod tests {
     fn preload_error_reveals_repl_even_if_closed_during_startup() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = LabPlot::new(vec![dir.path().join("missing.scm")]);
-        assert!(app.repl_visible);
-        app.repl_visible = false;
+        assert!(!app.repl_visible);
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while !app.repl_visible {
@@ -519,6 +517,43 @@ mod tests {
                 .drop_without_applying_deltas();
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn repl_button_toggles_panel_on_each_click() {
+        let ctx = egui::Context::default();
+        let mut visible = false;
+        let mut journal = false;
+        let labels = draw_labels(&ctx, [800., 600.], |ui| {
+            main_menu(ui, Phase::Stopped, &mut visible, &mut journal);
+        });
+        let button = labels.iter().find(|t| t.galley.job.text == "REPL").unwrap();
+        let pos = label_rect(button).center();
+        for expected in [true, false, true] {
+            for pressed in [true, false] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        [800., 600.].into(),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    main_menu(ui, Phase::Stopped, &mut visible, &mut journal)
+                })
+                .drop_without_applying_deltas();
+            }
+            assert_eq!(visible, expected);
         }
     }
 

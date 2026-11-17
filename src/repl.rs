@@ -866,6 +866,61 @@ mod tests {
     }
 
     #[test]
+    fn hidden_preload_and_reopened_panel_keep_engine_history_and_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.scm");
+        std::fs::write(
+            &path,
+            "(define (saved) 42) (plot/add! \"preloaded\" \"degC\")",
+        )
+        .unwrap();
+        let mut app = crate::LabPlot::new(vec![path]);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        while app.repl.busy || !app.plots.series.contains_key("preloaded") {
+            ctx.run_ui(Default::default(), |ui| app.update_ui(ui))
+                .drop_without_applying_deltas();
+            assert!(!app.repl_visible);
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (address, server) = crate::test_support::mock(|mut socket| {
+            crate::test_support::hello(&mut socket);
+            crate::test_support::until_closed(&mut socket);
+        });
+        app.connection.sender().connect(address).unwrap();
+        while app.connection.phase() != lab_plot::integration::Phase::Ready {
+            ctx.run_ui(Default::default(), |ui| app.update_ui(ui))
+                .drop_without_applying_deltas();
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for visible in [true, false, true] {
+            app.repl_visible = visible;
+            app.repl.input = "(saved)".into();
+            app.repl.execute_input();
+            while app.repl.busy {
+                ctx.run_ui(Default::default(), |ui| app.update_ui(ui))
+                    .drop_without_applying_deltas();
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.repl_visible, visible);
+            assert_eq!(app.repl.last_output, "42");
+            assert_eq!(app.connection.phase(), lab_plot::integration::Phase::Ready);
+        }
+        assert_eq!(app.repl.history.len(), 7);
+        assert_eq!(app.repl.command_history.commands.back().unwrap(), "(saved)");
+        app.connection.begin_close();
+        while !app.connection.is_closed() {
+            app.connection.update(&mut app.plots);
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
     fn preload_read_syntax_and_runtime_errors_stop_remaining_files_but_repl_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base.scm");

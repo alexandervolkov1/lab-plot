@@ -263,6 +263,32 @@ pub fn register_plot_functions(engine: &mut Engine, sender: ControlSender) {
 }
 
 pub fn register_lab_functions(engine: &mut Engine, sender: ControlSender) {
+    let tx = sender.clone();
+    engine.register_fn(
+        "lab/parameter-set!",
+        move |name: String, parameter: String, value: SteelVal| -> Result<SteelVal, String> {
+            text_limit(&name)?;
+            text_limit(&parameter)?;
+            let value = match &value {
+                SteelVal::StringV(value) => {
+                    text_limit(value)?;
+                    serde_json::json!(value.as_str())
+                }
+                _ => match set_value(&value)? {
+                    ScalarValue::Integer(v) => serde_json::json!(v),
+                    ScalarValue::Float(v) => serde_json::json!(v),
+                    ScalarValue::Boolean(v) => serde_json::json!(v),
+                },
+            };
+            tx.request_wait(Request::Components {
+                command: serde_json::json!({
+                    "action": "parameter_set", "name": name,
+                    "parameter": parameter, "value": value
+                }),
+            })
+            .and_then(response_value)
+        },
+    );
     for (function, action) in [
         ("lab/component-create!", "create"),
         ("lab/component-configure!", "configure"),

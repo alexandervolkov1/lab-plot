@@ -85,6 +85,25 @@ fn real_arduino_driver_ema_subscription_reaches_plot_without_hardware() {
         })
     ));
     let mut plot = PlotState::default();
+    component_request(
+        &client,
+        json!({"action":"create","expected_revision":1,"configuration":{"name":"loop","type_id":"pid","inputs":{"input":"processing/smooth/value"},"parameters":{"setpoint":20.},"max_age_ms":10000}}),
+    );
+    let changed = component_request(
+        &client,
+        json!({"action":"parameter_set","name":"loop","parameter":"setpoint","value":35.}),
+    );
+    assert_eq!(changed["revision"], 3);
+    plot.apply(PlotCommand::Add {
+        name: "Setpoint".into(),
+        unit: "degC".into(),
+    })
+    .unwrap();
+    plot.apply(PlotCommand::Bind {
+        name: "Setpoint".into(),
+        key: "processing/loop/setpoint".into(),
+    })
+    .unwrap();
     plot.apply(PlotCommand::Add {
         name: "Smooth".into(),
         unit: "degC".into(),
@@ -98,7 +117,10 @@ fn real_arduino_driver_ema_subscription_reaches_plot_without_hardware() {
     client
         .sender()
         .request(Request::Subscribe {
-            keys: vec!["processing/smooth/value".into()],
+            keys: vec![
+                "processing/smooth/value".into(),
+                "processing/loop/setpoint".into(),
+            ],
         })
         .unwrap();
     let ack = next(&client);
@@ -112,13 +134,22 @@ fn real_arduino_driver_ema_subscription_reaches_plot_without_hardware() {
         ),
         "{ack:?}"
     );
-    for _ in 0..3 {
+    while plot.series["Smooth"].points.len() < 3 || plot.series["Setpoint"].points.len() < 3 {
         let ClientEvent::Measurement(m) = next(&client) else {
             panic!("expected measurement")
         };
         assert!(plot.measurement(m).is_empty());
     }
     assert_eq!(plot.series["Smooth"].points.len(), 3);
+    assert_eq!(plot.series["Setpoint"].points.len(), 3);
+    for (smooth, setpoint) in plot.series["Smooth"]
+        .points
+        .iter()
+        .zip(&plot.series["Setpoint"].points)
+    {
+        assert_eq!(smooth.xy[0], setpoint.xy[0]);
+        assert_eq!(setpoint.xy[1], 35.);
+    }
     assert!(
         plot.series["Smooth"]
             .points

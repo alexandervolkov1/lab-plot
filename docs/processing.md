@@ -1,7 +1,6 @@
 # Processing components from Steel
 
-Requires the `components` API from lab-server's processing branch. The existing
-`scripts/arduino-start.scm` remains unchanged. Connect with the usual `lab/connect!`
+Requires lab-server's `components` API with `parameter_set` support. Connect with the usual `lab/connect!`
 and wait for Ready before using these operations. They wait for the server reply;
 errors raise Steel errors, and there are no automatic mutation retries.
 
@@ -12,6 +11,7 @@ errors raise Steel errors, and there are no automatic mutation retries.
 | `lab/outputs` | none |
 | `lab/component-create!` | configuration JSON string, expected revision |
 | `lab/component-configure!` | full configuration JSON string, expected revision |
+| `lab/parameter-set!` | component name, parameter name, scalar value; no revision read |
 | `lab/component-delete!` | name, cascade Boolean, expected revision |
 | `lab/controller-bind!` | name, target key, timeout ms, expected revision |
 | `lab/controller-state!` | name, state string, expected revision |
@@ -20,6 +20,36 @@ errors raise Steel errors, and there are no automatic mutation retries.
 Results preserve descriptor data as association lists with string keys; JSON arrays
 become lists, null becomes an empty list, and numbers/booleans retain their types.
 The client contains no switch on concrete component types.
+
+`lab/parameter-set!` sends one `components/parameter_set` request and waits for its
+snapshot response. It keeps no local configuration copy. Integer (including i64
+values beyond exact f64 precision), finite Float, Boolean and Choice strings retain
+their JSON types; unsupported values are rejected locally. The server validates the
+parameter name, type, range and cross-parameter constraints atomically. Errors raise
+Steel errors and leave the configuration/revision unchanged. Success increments the
+revision once and preserves all other fields and subscriptions. A running EMA keeps
+its state when tau changes. PID retuning requires leaving Auto first; no operation
+implicitly enables Auto or writes physical output.
+
+```scheme
+(lab/parameter-set! "loop" "setpoint" 35.0)
+(lab/parameter-set! "loop" "kp" 3.0)
+(lab/parameter-set! "loop" "ki" 0.2)
+(lab/parameter-set! "smooth" "tau" 5.0)
+(define (setpoint! value) (lab/parameter-set! "loop" "setpoint" value))
+
+(plot/add! "Setpoint" "degC")
+(plot/bind! "Setpoint" "processing/loop/setpoint")
+(lab/subscribe! '("processing/loop/setpoint"))
+```
+
+Setpoint inherits the input unit and is published in Shadow and Auto with the PID
+measurement time, starting with the next successful input calculation after a change.
+Before that calculation, get returns the last sample. kp/ki/kd remain configuration
+parameters; p/i/d are existing diagnostics. Optional CAS is available through
+`lab/component!`, for example a JSON command with `action:"parameter_set"`, `name`,
+`parameter`, `value` and `expected_revision`. Omitting the revision (or null) updates
+the current server configuration under its lock; a supplied stale revision fails.
 
 This example assumes a fresh server with revision 0; otherwise read `lab/components`
 and use its revision. A concurrent edit requires reading the revision again, not retrying
@@ -88,17 +118,25 @@ if retaining the connection is desired; then use `lab/component-delete!` with th
 revision. Cascade also stops/removes dependent controllers. Reconnection does not restart
 controllers and does not replay earlier measurements.
 
-Validation on this branch: Debug/Release builds, fmt, check --all-targets,
-Clippy --all-targets -- -D warnings and git diff --check passed. Each full test
-profile passed 143 tests, with one pre-existing external-server test ignored.
-The opt-in `tests/server_contract/Cargo.toml` suite now passes all four tests in
-Debug and Release against an in-process server. It covers real Arduino protocol
-parsing through EMA into PlotState and the Managed Arduino → EMA → PID → output
-path, binding visibility from another client, direct-handle rejection, Manual/Auto
-and shutdown over both TCP and WS. The Managed client scenario also passed five
-additional runs per profile. No serial port was opened. The production client and
-`arduino-start.scm` did not need changes for these review fixes.
+Validation uses memory-backed I/O and loopback TCP/WS; no serial port is opened.
+Run the main suite with `RUST_TEST_THREADS=2` to limit concurrent Steel startup:
 
-During the initial implementation, four existing GUI/Steel tests hit their time
-limits in a simultaneous server/client validation run; its isolated rerun passed.
-The complete review reruns passed without changing those tests or their deadlines.
+```powershell
+$env:RUST_TEST_THREADS = '2'
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo test --release
+# Additional contract with the sibling lab-server checkout:
+$env:CARGO_TARGET_DIR = (Join-Path (Get-Location) 'target')
+cargo test --manifest-path tests/server_contract/Cargo.toml
+cargo test --release --manifest-path tests/server_contract/Cargo.toml
+```
+
+The contract covers Arduino protocol parsing through EMA and PID into PlotState,
+including a parameter_set update of the setpoint, its unit and timestamp. It also
+covers Managed output authority, Manual/Auto and shutdown over TCP and WS. The main
+suite checks one-request Steel parameter updates (Integer/Float/Boolean/Choice),
+server errors and hidden/reopened REPL state. One existing smoke test needs an
+external server and stays ignored by default.

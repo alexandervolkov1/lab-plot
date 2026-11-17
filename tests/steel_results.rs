@@ -309,6 +309,67 @@ fn generic_component_wrappers_preserve_schema_data_and_mutation_errors() {
 }
 
 #[test]
+fn parameter_set_sends_one_request_and_preserves_scalar_types_over_tcp_and_ws() {
+    for ws in [false, true] {
+        let mut c = Integration::default();
+        let mut p = PlotState::default();
+        let steel = SteelWorker::new(c.sender());
+        let (endpoint, task) = server(ws, |mut peer| {
+            peer.hello();
+            for value in [
+                json!(9007199254740993i64),
+                json!(i64::MAX),
+                json!(35.0),
+                json!(true),
+                json!(false),
+                json!("choice"),
+            ] {
+                let request = peer.read();
+                assert_eq!(request["op"], "components");
+                assert_eq!(
+                    request["command"],
+                    json!({"action":"parameter_set","name":"custom","parameter":"value","value":value})
+                );
+                if value.is_f64() {
+                    assert!(request["command"]["value"].is_f64());
+                }
+                peer.send(json!({"id":request["id"],"status":"ok","data":{"revision":2}}));
+            }
+            let request = peer.read();
+            assert_eq!(request["command"]["action"], "parameter_set");
+            peer.send(json!({"id":request["id"],"status":"error","error":"stop_before_configure"}));
+            peer.until_closed();
+        });
+        c.sender().connect_endpoint(endpoint).unwrap();
+        pump(&mut c, &mut p, |c| c.phase() == Phase::Ready);
+        for value in [
+            "9007199254740993",
+            "9223372036854775807",
+            "35.0",
+            "#t",
+            "#f",
+            "\"choice\"",
+        ] {
+            let rx = steel.eval(format!("(lab/parameter-set! \"custom\" \"value\" {value})"));
+            assert!(result(&mut c, &mut p, rx).unwrap()[0].contains("revision"));
+        }
+        for value in ["'(1 2)", "9223372036854775808", "+inf.0", "+nan.0"] {
+            let rx = steel.eval(format!("(lab/parameter-set! \"custom\" \"value\" {value})"));
+            assert!(result(&mut c, &mut p, rx).is_err());
+        }
+        let rx = steel.eval("(lab/parameter-set! \"custom\" \"value\" 2)".into());
+        assert!(
+            result(&mut c, &mut p, rx)
+                .unwrap_err()
+                .contains("stop_before_configure")
+        );
+        c.begin_close();
+        pump(&mut c, &mut p, Integration::is_closed);
+        task.join().unwrap();
+    }
+}
+
+#[test]
 fn slow_server_does_not_block_gui_and_replies_are_matched_out_of_order() {
     for ws in [false, true] {
         let mut c = Integration::default();
