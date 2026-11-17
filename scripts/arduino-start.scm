@@ -51,10 +51,20 @@
           (wait-ready! 100)))
     (else #f)))
 
+;; Configure randomized thermal model
+(define (configure-model!)
+  (set "furnace1/designer/seed" 12345)
+  (set "furnace1/designer/parameter.spread" 0.03)
+  (set "furnace1/designer/power.fluctuation" 0.03)
+  (set "furnace1/designer/sensor.noise" 0.2)
+  (set "furnace1/designer/sensor.drift" 0.1)
+  (lab/invoke-action! "furnace1/apply"))
+
 ;; Initialize plots and subscriptions
 (define (start!)
   (if (connect!)
       (begin
+        (configure-model!)
         (curve! "Heater" "degC" heater)
         (curve! "Sample" "degC" sample)
         (curve! "Room" "degC" room)
