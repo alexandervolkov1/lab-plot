@@ -10,6 +10,7 @@ use steel::steel_vm::engine::Engine;
 mod files;
 mod highlight;
 mod indent;
+mod results;
 
 use files::{SaveError, ScriptFile};
 
@@ -96,7 +97,7 @@ fn evaluate(engine: &mut Engine, request: EvalRequest) -> Result<String, String>
             let text = values
                 .into_iter()
                 .filter(|value| !matches!(value, SteelVal::Void))
-                .map(|value| value.to_string())
+                .map(|value| results::format(&value))
                 .collect::<Vec<_>>()
                 .join("\n");
             if text.is_empty() { "ok".into() } else { text }
@@ -1384,6 +1385,130 @@ mod tests {
         repl.execute_input();
         finish(&mut repl);
         assert_eq!(repl.last_output, "30");
+    }
+
+    #[test]
+    fn evaluation_formats_only_successful_values_and_preserves_errors() {
+        let mut engine = Engine::new();
+        let mut eval = |source: &str| {
+            evaluate(
+                &mut engine,
+                EvalRequest {
+                    source: source.into(),
+                    path: None,
+                },
+            )
+        };
+        assert_eq!(
+            eval("42 3.14 #true \"ready\"").unwrap(),
+            "42\n3.14\n#true\n\"ready\""
+        );
+        assert_eq!(eval("(define saved-result '((1 2) (3 4)))").unwrap(), "ok");
+        assert_eq!(eval("saved-result").unwrap(), "((1 2)\n (3 4))");
+        assert_eq!(eval("(car saved-result)").unwrap(), "(1 2)");
+        let source = "(error \"pretty failure\")";
+        let expected = format!(
+            "Error: {}",
+            engine.compile_and_run_raw_program(source).unwrap_err()
+        );
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                EvalRequest {
+                    source: source.into(),
+                    path: None
+                }
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn large_formatted_results_retain_history_byte_and_utf8_limits() {
+        let mut repl = Repl::new(Vec::new(), |_| {});
+        repl.input = "(map (lambda (n) (list \"🌡температура\" n)) (range 0 2000))".into();
+        repl.execute_input();
+        finish(&mut repl);
+        assert!(!repl.last_output.starts_with("Error:"));
+        assert_eq!(repl.last_output.lines().count(), 2000);
+        assert!(repl.last_output.len() > MAX_HISTORY_ENTRY_BYTES);
+        let entry = repl.history.back().unwrap();
+        assert!(entry.len() <= MAX_HISTORY_ENTRY_BYTES);
+        let prefix = entry.strip_suffix('…').unwrap();
+        assert!(repl.last_output.starts_with(prefix));
+        assert!(MAX_HISTORY_ENTRY_BYTES - entry.len() < 4);
+        assert!(entry.contains("\n (\"🌡температура\""));
+        assert_eq!(repl.command_history.commands.len(), 1);
+    }
+
+    #[test]
+    fn formatted_history_is_monospace_multiline_and_copyable() {
+        let mut repl = Repl::new(Vec::new(), |_| {});
+        repl.input = "'((\"name\" \"loop\") (\"value\" 35.0))".into();
+        repl.execute_input();
+        finish(&mut repl);
+        let text = repl.last_output.clone();
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut repl, vec![]).drop_without_applying_deltas();
+        let output = frame(&ctx, &mut repl, vec![]);
+        let shape = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == text => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            shape
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|s| s.format.font_id.family == egui::FontFamily::Monospace)
+        );
+        assert_eq!(shape.galley.rows.len(), 2);
+        let cursor_pos = |index| {
+            shape.pos
+                + shape
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(index))
+                    .center()
+                    .to_vec2()
+        };
+        let start = cursor_pos(0);
+        let end = cursor_pos(text.chars().count());
+        output.drop_without_applying_deltas();
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            vec![egui::Event::PointerMoved(end)],
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        ] {
+            frame(&ctx, &mut repl, events).drop_without_applying_deltas();
+        }
+        let copied = frame(&ctx, &mut repl, vec![egui::Event::Copy]);
+        assert!(
+            copied
+                .platform_output
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(s) if s == &text)),
+            "{:?}",
+            copied.platform_output.commands
+        );
+        copied.drop_without_applying_deltas();
     }
 
     #[test]
